@@ -44,6 +44,7 @@ void set_params_fprop(Flash_fwd_params &params,
                       float softmax_scale,
                       int window_size_left,
                       int window_size_right,
+                      int attention_chunk,
                       const float softcap=0.f,
                       const int sm_margin=0) {
 
@@ -116,14 +117,19 @@ void set_params_fprop(Flash_fwd_params &params,
 
     // Causal is the special case where window_size_right == 0 and window_size_left < 0.
     // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-    params.is_causal = window_size_left < 0 && window_size_right == 0;
-    params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
+    params.is_causal = window_size_left < 0 && window_size_right == 0 && attention_chunk == 0;
+    params.is_local = (window_size_left >= 0 || window_size_right >= 0 || attention_chunk >= 1) && !params.is_causal;
 
     // TODO: check this
-    if (window_size_left < 0 && window_size_right >= 0) { window_size_left = seqlen_k - 1; }
-    if (window_size_left >= 0 && window_size_right < 0) { window_size_right = seqlen_q - 1; }
+    if (window_size_left < 0) { window_size_left = seqlen_k - 1; }
+    if (window_size_right < 0) { window_size_right = seqlen_q - 1; }
+    if (attention_chunk > 0) {
+        window_size_left = std::min(window_size_left, attention_chunk - 1);
+        window_size_right = std::min(window_size_right, attention_chunk - 1);
+    }
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
+    params.attention_chunk = attention_chunk;
 
     params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
     params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
@@ -166,6 +172,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                       float softmax_scale,
                       int window_size_left,
                       int window_size_right,
+                      int attention_chunk,
                       const float softcap=0.f,
                       bool deterministic=false,
                       int const sm_margin=0) {
@@ -182,6 +189,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                      softmax_scale,
                      window_size_left,
                      window_size_right,
+                     attention_chunk,
                      softcap,
                      sm_margin);
 
@@ -216,6 +224,108 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.deterministic = deterministic;
 }
 
+template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA, bool Has_softcap>
+void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
+    if (!params.is_e4m3) {
+        if (params.is_bf16) {
+            #ifndef FLASHATTENTION_DISABLE_HDIM64
+            if (params.d <= 64) {
+                if constexpr (Arch == 90) {
+                    if (params.dv > 256) {
+                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                    } else if (params.dv > 64) {
+                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                    }
+                }
+                return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+            }
+            #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM96
+            if (params.d <= 96) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 96, 96, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+            #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM128
+            if (params.d <= 128) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+            #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM192
+            if (params.d <= 192) {
+                if constexpr (Arch == 90) {
+                    if (params.dv <= 128) {
+                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                    }
+                }
+                return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+            }
+            #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM256
+            if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+            #endif
+        } else {
+            #ifndef FLASHATTENTION_DISABLE_FP16
+            #ifndef FLASHATTENTION_DISABLE_HDIM64
+            if (params.d <= 64) {
+                if constexpr (Arch == 90) {
+                    if (params.dv > 256) {
+                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                    } else if (params.dv > 64) {
+                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                    }
+                }
+                return run_mha_fwd_<Arch, cutlass::half_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+            }
+            #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM96
+            if (params.d <= 96) { return run_mha_fwd_<Arch, cutlass::half_t, 96, 96, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+            #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM128
+            if (params.d <= 128) { return run_mha_fwd_<Arch, cutlass::half_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+            #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM192
+            if (params.d <= 192) {
+                if constexpr (Arch == 90) {
+                    if (params.dv <= 128) {
+                        return run_mha_fwd_<Arch, cutlass::half_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                    }
+                }
+                return run_mha_fwd_<Arch, cutlass::half_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+            }
+            #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM256
+            if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::half_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+            #endif
+            #else
+            TORCH_CHECK(false, "This flash attention build does not support FP16.");
+            #endif
+        }
+    } else {
+        #ifndef FLASHATTENTION_DISABLE_FP8
+        #ifndef FLASHATTENTION_DISABLE_HDIM64
+        if (params.d <= 64) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM96
+        if (params.d <= 96) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 96, 96, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM128
+        if (params.d <= 128) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM192
+        if (params.d <= 192) {
+            if constexpr (Arch == 90) {
+                if (params.dv <= 128) {
+                    return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                }
+            }
+            return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+        }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM256
+        if (params.d <= 256) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+        #endif
+        #else
+        TORCH_CHECK(false, "This flash attention build does not support FP8.");
+        #endif
+    }
+}
+
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // HEADDIM_SWITCH(params.d, [&] {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
@@ -228,99 +338,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation
                     static constexpr bool PackGQA = PackGQA_ || Arch < 90 || PagedKVNonTMA || Split;
                     SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
-                        if (!params.is_e4m3) {
-                            if (params.is_bf16) {
-                                #ifndef FLASHATTENTION_DISABLE_HDIM64
-                                if (params.d <= 64) {
-                                    if (params.dv > 256 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    } else if (params.dv > 64 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    } else {
-                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    }
-                                }
-                                #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM96
-                                if (params.d <= 96) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 96, 96, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
-                                #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM128
-                                if (params.d <= 128) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
-                                #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM192
-                                if (params.d <= 192) {
-                                    if (params.dv <= 128 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    } else {
-                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    }
-                                }
-                                #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM256
-                                if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
-                                #endif
-                            } else {
-                                #ifndef FLASHATTENTION_DISABLE_FP16
-                                #ifndef FLASHATTENTION_DISABLE_HDIM64
-                                if (params.d <= 64) {
-                                    if (params.dv > 256 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    } else if (params.dv > 64 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    } else {
-                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    }
-                                }
-                                #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM96
-                                if (params.d <= 96) { return run_mha_fwd_<Arch, cutlass::half_t, 96, 96, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
-                                #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM128
-                                if (params.d <= 128) { return run_mha_fwd_<Arch, cutlass::half_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
-                                #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM192
-                                if (params.d <= 192) {
-                                    if (params.dv <= 128 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::half_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    } else {
-                                        return run_mha_fwd_<Arch, cutlass::half_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                    }
-                                }
-                                #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM256
-                                if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::half_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
-                                #endif
-                                #else
-                                TORCH_CHECK(false, "This flash attention build does not support FP16.");
-                                #endif
-                            }
-                        } else {
-                            #ifndef FLASHATTENTION_DISABLE_FP8
-                            #ifndef FLASHATTENTION_DISABLE_HDIM64
-                            if (params.d <= 64) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
-                            #endif
-                            #ifndef FLASHATTENTION_DISABLE_HDIM96
-                            if (params.d <= 96) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 96, 96, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
-                            #endif
-                            #ifndef FLASHATTENTION_DISABLE_HDIM128
-                            if (params.d <= 128) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
-                            #endif
-                            #ifndef FLASHATTENTION_DISABLE_HDIM192
-                            if (params.d <= 192) {
-                                if (params.dv <= 128 && Arch == 90) {
-                                    return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                } else {
-                                    return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                                }
-                            }
-                            #endif
-                            #ifndef FLASHATTENTION_DISABLE_HDIM256
-                            if (params.d <= 256) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
-                            #endif
-                            #else
-                            TORCH_CHECK(false, "This flash attention build does not support FP8.");
-                            #endif
-                        }
+                        run_mha_fwd_constexpr<Arch, Split, PagedKVNonTMA, PackGQA, Has_softcap>(params, stream);
                     });
                 });
             });
@@ -464,29 +482,30 @@ inline int round_up_headdimv(int head_size) {
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
 at::Tensor
 mha_fwd_get_scheduler_metadata(
-        int batch_size,
-        int max_seqlen_q,
-        int max_seqlen_k,
-        int num_heads,
-        int num_heads_k,
-        int headdim,
-        int headdim_v,
+        int64_t batch_size,
+        int64_t max_seqlen_q,
+        int64_t max_seqlen_k,
+        int64_t num_heads,
+        int64_t num_heads_k,
+        int64_t headdim,
+        int64_t headdim_v,
         at::ScalarType qkv_dtype,
-        const at::Tensor &seqused_k, // b
-        std::optional<const at::Tensor> &cu_seqlens_q_,  // b+1
-        std::optional<const at::Tensor> &cu_seqlens_k_,  // b+1
-        std::optional<const at::Tensor> &cu_seqlens_k_new_,  // b+1
-        std::optional<const at::Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
-        std::optional<const at::Tensor> &leftpad_k_, // b
-        std::optional<int> page_size,
-        int max_seqlen_k_new,  // 0 means we're not appending new KV
+        at::Tensor seqused_k, // b
+        std::optional<at::Tensor> cu_seqlens_q_,  // b+1
+        std::optional<at::Tensor> cu_seqlens_k_,  // b+1
+        std::optional<at::Tensor> cu_seqlens_k_new_,  // b+1
+        std::optional<at::Tensor> seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
+        std::optional<at::Tensor> leftpad_k_, // b
+        std::optional<int64_t> page_size,
+        int64_t max_seqlen_k_new,  // 0 means we're not appending new KV
         bool is_causal,
-        int window_size_left,
-        int window_size_right,
+        int64_t window_size_left,
+        int64_t window_size_right,
+        int64_t attention_chunk,
         bool has_softcap,
-        int num_splits,
+        int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int const sm_margin
+        int64_t sm_margin
         ) {
 
     TORCH_CHECK(qkv_dtype == at::ScalarType::Half || qkv_dtype == at::ScalarType::BFloat16 || qkv_dtype == at::ScalarType::Float8_e4m3fn,
@@ -520,7 +539,7 @@ mha_fwd_get_scheduler_metadata(
     if (window_size_left >= max_seqlen_k - 1) { window_size_left = -1; }
     if (window_size_right >= max_seqlen_q - 1) { window_size_right = -1; }
     // causal=true is the same as causal=false in this case
-    if (max_seqlen_q == 1 && window_size_left == -1 && window_size_right == -1) {
+    if (max_seqlen_q == 1 && window_size_left == -1 && window_size_right == -1 && attention_chunk == 0) {
         // Special case of hdim 128 where we want causal to have kBlockN=128, better for pagedKV and TMA
         if ((headdim <= 64 || headdim > 128) || !page_size.has_value()) {
             is_causal = false;
@@ -528,12 +547,17 @@ mha_fwd_get_scheduler_metadata(
     }
     if (is_causal) { window_size_right = 0; }
 
-    params.is_causal = window_size_left < 0 && window_size_right == 0;
-    params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
-    if (window_size_left < 0 && window_size_right >= 0) { window_size_left = max_seqlen_k - 1; }
-    if (window_size_left >= 0 && window_size_right < 0) { window_size_right = max_seqlen_q - 1; }
+    params.is_causal = window_size_left < 0 && window_size_right == 0 && attention_chunk == 0;
+    params.is_local = (window_size_left >= 0 || window_size_right >= 0 || attention_chunk >= 1) && !params.is_causal;
+    if (window_size_left < 0) { window_size_left = max_seqlen_k - 1; }
+    if (window_size_right < 0) { window_size_right = max_seqlen_q - 1; }
+    if (attention_chunk > 0) {
+        window_size_left = std::min(window_size_left, attention_chunk - 1);
+        window_size_right = std::min(window_size_right, attention_chunk - 1);
+    }
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
+    params.attention_chunk = attention_chunk;
     params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
     params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
     params.softcap = has_softcap ? 1.0f : 0.0f;
@@ -590,41 +614,42 @@ mha_fwd_get_scheduler_metadata(
 // h: num_heads
 // h_k: num_heads_k
 // d: head_size
-std::vector<at::Tensor>
-mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-        const at::Tensor &k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table.
-        const at::Tensor &v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table.
-        std::optional<const at::Tensor> &k_new_,  // (b, s_k_new, h_k, d) or (total_k_new, h_k, d) if there is cu_seqlens_k_new
-        std::optional<const at::Tensor> &v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
-        std::optional<const at::Tensor> &q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
-        std::optional<at::Tensor> &out_,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
-        std::optional<const at::Tensor> &cu_seqlens_q_,  // b+1
-        std::optional<const at::Tensor> &cu_seqlens_k_,  // b+1
-        std::optional<const at::Tensor> &cu_seqlens_k_new_,  // b+1
-        std::optional<const at::Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
-        std::optional<const at::Tensor> &seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
-        std::optional<int> max_seqlen_q_,
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+        at::Tensor k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table.
+        at::Tensor v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table.
+        std::optional<at::Tensor> k_new_,  // (b, s_k_new, h_k, d) or (total_k_new, h_k, d) if there is cu_seqlens_k_new
+        std::optional<at::Tensor> v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
+        std::optional<at::Tensor> q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
+        std::optional<at::Tensor> out_,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+        std::optional<at::Tensor> cu_seqlens_q_,  // b+1
+        std::optional<at::Tensor> cu_seqlens_k_,  // b+1
+        std::optional<at::Tensor> cu_seqlens_k_new_,  // b+1
+        std::optional<at::Tensor> seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
+        std::optional<at::Tensor> seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
+        std::optional<int64_t> max_seqlen_q_,
         // TODO: check if we need max_seqlen_k
-        std::optional<int> max_seqlen_k_,
-        std::optional<const at::Tensor> &page_table_, // (b_k, max_num_pages_per_seq)
-        std::optional<const at::Tensor> &kv_batch_idx_, // b. indices to index into the KV cache
-        std::optional<const at::Tensor> &leftpad_k_, // b
-        std::optional<const at::Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
-        std::optional<const at::Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
-        std::optional<const at::Tensor> &seqlens_rotary_, // b
-        std::optional<at::Tensor> &q_descale_,  // (b, h_k), not (b, h)
-        std::optional<at::Tensor> &k_descale_,  // (b, h_k)
-        std::optional<at::Tensor> &v_descale_,  // (b, h_k)
-        float const softmax_scale,
+        std::optional<int64_t> max_seqlen_k_,
+        std::optional<at::Tensor> page_table_, // (b_k, max_num_pages_per_seq)
+        std::optional<at::Tensor> kv_batch_idx_, // b. indices to index into the KV cache
+        std::optional<at::Tensor> leftpad_k_, // b
+        std::optional<at::Tensor> rotary_cos_, // seqlen_ro x (rotary_dim / 2)
+        std::optional<at::Tensor> rotary_sin_, // seqlen_ro x (rotary_dim / 2)
+        std::optional<at::Tensor> seqlens_rotary_, // b
+        std::optional<at::Tensor> q_descale_,  // (b, h_k), not (b, h)
+        std::optional<at::Tensor> k_descale_,  // (b, h_k)
+        std::optional<at::Tensor> v_descale_,  // (b, h_k)
+        std::optional<double> softmax_scale_,
         bool is_causal,
-        int window_size_left,
-        int window_size_right,
-        float const softcap,
-        bool const is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-        std::optional<at::Tensor> &scheduler_metadata_,  // (b + 1)
-        int num_splits,
+        int64_t window_size_left,
+        int64_t window_size_right,
+        int64_t attention_chunk,
+        double softcap,
+        bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
+        std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
+        int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int const sm_margin
+        int64_t sm_margin
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -689,6 +714,10 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
     int const num_heads_k = k.size(-2);
     int const batch_size_k = !paged_KV ? (!is_varlen_k ? k.size(0) : cu_seqlens_k.size(0) - 1) : page_table.size(0);
+    double softmax_scale = 1.0 / sqrt(double(head_size));
+    if (softmax_scale_.has_value()) {
+        softmax_scale = softmax_scale_.value();
+    }
     if (!kv_batch_idx_.has_value()) {
         TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
     }
@@ -712,16 +741,13 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
     if (window_size_right >= seqlen_q - 1) { window_size_right = -1; }
     // causal=true is the same as causal=false in this case
-    if (seqlen_q == 1 && window_size_left == -1 && window_size_right == -1) {
+    if (seqlen_q == 1 && window_size_left == -1 && window_size_right == -1 && attention_chunk == 0) {
         // Special case of hdim 128 where we want causal to have kBlockN=128, better for pagedKV and TMA
         if ((head_size <= 64 || head_size > 128) || !paged_KV) {
             is_causal = false;
         }
     }
     if (is_causal) { window_size_right = 0; }
-    // There's a case where is_causal=false, window_size=(-1, 0). Then set_params_fprop will set params.is_causal=true.
-    // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM.
-    is_causal = window_size_left < 0 && window_size_right == 0;
 
     if (!is_varlen_q) {
         CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
@@ -827,6 +853,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
                      softmax_scale,
                      window_size_left,
                      window_size_right,
+                     attention_chunk,
                      softcap,
                      sm_margin);
     params.total_q = total_q;
@@ -1099,8 +1126,53 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
+#ifdef FLASHATTENTION_DISABLE_BACKWARD
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
-    #ifndef FLASHATTENTION_DISABLE_BACKWARD
+    TORCH_CHECK(false, "Flash-Attention was built with backward disabled");
+}
+#else
+template <int Arch, bool Has_softcap>
+void run_mha_bwd_constexpr(Flash_bwd_params &params, cudaStream_t stream) {
+    if (!params.is_bf16) {
+        #ifndef FLASHATTENTION_DISABLE_FP16
+        #ifndef FLASHATTENTION_DISABLE_HDIM64
+        if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::half_t, 64, Has_softcap>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM96
+        if (params.d_rounded == 96) { return run_mha_bwd_<Arch, cutlass::half_t, 96, Has_softcap>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM128
+        if (params.d_rounded == 128) { return run_mha_bwd_<Arch, cutlass::half_t, 128, Has_softcap>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM192
+        if (params.d_rounded == 192) { return run_mha_bwd_<Arch, cutlass::half_t, 192, Has_softcap>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM256
+        if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::half_t, 256, Has_softcap>(params, stream); }
+        #endif
+        #else
+        TORCH_CHECK(false, "This flash attention build does not support FP16.");
+        #endif
+    } else {
+        #ifndef FLASHATTENTION_DISABLE_HDIM64
+        if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, Has_softcap>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM96
+        if (params.d_rounded == 96) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 96, Has_softcap>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM128
+        if (params.d_rounded == 128) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 128, Has_softcap>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM192
+        if (params.d_rounded == 192) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM256
+        if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap>(params, stream); }
+        #endif
+    }
+}
+
+void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         // FP16_SWITCH(!params.is_bf16, [&] {
         //     HEADDIM_SWITCH(params.d, [&] {
         //         run_mha_bwd_<elem_type, kHeadDim>(params, stream);
@@ -1108,47 +1180,11 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         // });
     ARCH_SWITCH(params.arch, Arch, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
-            if (!params.is_bf16) {
-                #ifndef FLASHATTENTION_DISABLE_FP16
-                #ifndef FLASHATTENTION_DISABLE_HDIM64
-                if (params.d <= 64) { return run_mha_bwd_<Arch, cutlass::half_t, 64, Has_softcap>(params, stream); }
-                #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM96
-                if (params.d <= 96) { return run_mha_bwd_<Arch, cutlass::half_t, 96, Has_softcap>(params, stream); }
-                #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM128
-                if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::half_t, 128, Has_softcap>(params, stream); }
-                #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM192
-                if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::half_t, 192, Has_softcap>(params, stream); }
-                #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM256
-                if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::half_t, 256, Has_softcap>(params, stream); }
-                #endif
-                #else
-                TORCH_CHECK(false, "This flash attention build does not support FP16.");
-                #endif
-            } else {
-                #ifndef FLASHATTENTION_DISABLE_HDIM64
-                if (params.d <= 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, Has_softcap>(params, stream); }
-                #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM96
-                if (params.d <= 96) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 96, Has_softcap>(params, stream); }
-                #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM128
-                if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 128, Has_softcap>(params, stream); }
-                #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM192
-                if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap>(params, stream); }
-                #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM256
-                if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap>(params, stream); }
-                #endif
-            }
+            run_mha_bwd_constexpr<Arch, Has_softcap>(params, stream);
         });
     });
-    #endif
 }
+#endif
 
 
 // b: batch_size
@@ -1157,29 +1193,30 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 // h: num_heads
 // h_k: num_heads_k
 // d: head_size
-std::vector<at::Tensor> mha_bwd(
-    const at::Tensor &dout,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-    const at::Tensor &q,     // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-    const at::Tensor &k,     // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
-    const at::Tensor &v,     // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
-    const at::Tensor &out,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-    const at::Tensor &softmax_lse,    // (b, h, s_q) or (h, total_q) if there is cu_seqlens_q
-    std::optional<at::Tensor> &dq_,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-    std::optional<at::Tensor> &dk_,   // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
-    std::optional<at::Tensor> &dv_,   // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
-    std::optional<const at::Tensor> &cu_seqlens_q_,   // b+1
-    std::optional<const at::Tensor> &cu_seqlens_k_,   // b+1
-    std::optional<const at::Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
-    std::optional<const at::Tensor> &seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
-    std::optional<int> max_seqlen_q_,
-    std::optional<int> max_seqlen_k_,
-    float const softmax_scale,
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
+    at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+    at::Tensor q,     // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+    at::Tensor k,     // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
+    at::Tensor v,     // (b, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k
+    at::Tensor out,   // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+    at::Tensor softmax_lse,    // (b, h, s_q) or (h, total_q) if there is cu_seqlens_q
+    std::optional<at::Tensor> dq_,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+    std::optional<at::Tensor> dk_,   // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
+    std::optional<at::Tensor> dv_,   // (b, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k
+    std::optional<at::Tensor> cu_seqlens_q_,   // b+1
+    std::optional<at::Tensor> cu_seqlens_k_,   // b+1
+    std::optional<at::Tensor> seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
+    std::optional<at::Tensor> seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
+    std::optional<int64_t> max_seqlen_q_,
+    std::optional<int64_t> max_seqlen_k_,
+    std::optional<double> softmax_scale_,
     bool is_causal,
-    int window_size_left,
-    int window_size_right,
-    float const softcap,
-    bool const deterministic,
-    int const sm_margin) {
+    int64_t window_size_left,
+    int64_t window_size_right,
+    double softcap,
+    bool deterministic,
+    int64_t sm_margin
+) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -1234,13 +1271,19 @@ std::vector<at::Tensor> mha_bwd(
     int const total_q = !is_varlen_q ? batch_size * sizes[1] : sizes[0];
     int const num_heads = q.size(-2);
     int const head_size = q.size(-1);
+    int const head_size_v = v.size(-1);
     int const seqlen_k = !is_varlen_k ? k.size(1) : max_seqlen_k_.value();
     int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
     int const num_heads_k = k.size(-2);
     TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
+    TORCH_CHECK(head_size_v % 8 == 0, "head_size_v should be a multiple of 8");
     int const max_headdim = get_max_headdim();
-    TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
+    TORCH_CHECK(std::max(head_size, head_size_v) <= max_headdim, "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+    double softmax_scale = 1.0 / sqrt(double(head_size));
+    if (softmax_scale_.has_value()) {
+        softmax_scale = softmax_scale_.value();
+    }
 
     // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
     if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
@@ -1251,7 +1294,8 @@ std::vector<at::Tensor> mha_bwd(
     is_causal = window_size_left < 0 && window_size_right == 0;
 
     int const arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
-    int const head_size_rounded = round_up_headdim(head_size);
+    int const head_size_rounded = round_up_headdim(std::max(head_size, head_size_v));
+    int const head_size_v_rounded = head_size_rounded;
     // Very important that these match the kernel configs
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
     int const kBlockM_sm90 = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
@@ -1280,20 +1324,20 @@ std::vector<at::Tensor> mha_bwd(
 
     if (!is_varlen_q) {
         CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
-        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
-        CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size);
+        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_v);
+        CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size_v);
     } else {
         CHECK_SHAPE(q, total_q, num_heads, head_size);
-        CHECK_SHAPE(out, total_q, num_heads, head_size);
-        CHECK_SHAPE(dout, total_q, num_heads, head_size);
+        CHECK_SHAPE(out, total_q, num_heads, head_size_v);
+        CHECK_SHAPE(dout, total_q, num_heads, head_size_v);
         CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     }
     if (!is_varlen_k) {
         CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
-        CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
+        CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
     } else {
         CHECK_SHAPE(k, total_k, num_heads_k, head_size);
-        CHECK_SHAPE(v, total_k, num_heads_k, head_size);
+        CHECK_SHAPE(v, total_k, num_heads_k, head_size_v);
         CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
     }
 
@@ -1343,9 +1387,9 @@ std::vector<at::Tensor> mha_bwd(
         CHECK_DEVICE(dv);
         TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
         if (!is_varlen_k) {
-            CHECK_SHAPE(dv, batch_size, seqlen_k, num_heads_k, head_size);
+            CHECK_SHAPE(dv, batch_size, seqlen_k, num_heads_k, head_size_v);
         } else {
-            CHECK_SHAPE(dv, total_k, num_heads_k, head_size);
+            CHECK_SHAPE(dv, total_k, num_heads_k, head_size_v);
         }
     } else {
         dv = torch::empty_like(v);
@@ -1375,10 +1419,10 @@ std::vector<at::Tensor> mha_bwd(
     if (num_heads_k != num_heads) {  // MQA / GQA
         if (!is_varlen) {
             dk_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_rounded}, opts.dtype(at::kFloat));
-            dv_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_rounded}, opts.dtype(at::kFloat));
+            dv_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_v_rounded}, opts.dtype(at::kFloat));
         } else {
             dk_accum = torch::zeros({num_heads_k, total_k_padded_rounded, head_size_rounded}, opts.dtype(at::kFloat));
-            dv_accum = torch::zeros({num_heads_k, total_k_padded_rounded, head_size_rounded}, opts.dtype(at::kFloat));
+            dv_accum = torch::zeros({num_heads_k, total_k_padded_rounded, head_size_v_rounded}, opts.dtype(at::kFloat));
         }
     }
 
@@ -1404,13 +1448,15 @@ std::vector<at::Tensor> mha_bwd(
                      softmax_scale,
                      window_size_left,
                      window_size_right,
+                     0,  // attention_chunk
                      softcap,
                      deterministic,
                      sm_margin);
     params.total_q = total_q;
     params.total_k = total_k;
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
-    params.dv = head_size;  // We don't support hdim_v being different from hdim_qk for now
+    params.dv = head_size_v;
+    params.dv_rounded = head_size_v_rounded;
 
     // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
@@ -1448,9 +1494,9 @@ std::vector<at::Tensor> mha_bwd(
     return { dq, dk, dv, softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum };
 }
 
-std::vector<at::Tensor>
-mha_combine(const at::Tensor &out_partial,         // num_splits x batch_size x seqlen x num_heads x head_size
-            const at::Tensor &lse_partial,         // num_splits x batch_size x seqlen x num_heads
+std::tuple<at::Tensor, at::Tensor>
+mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen x num_heads x head_size
+            at::Tensor lse_partial,         // num_splits x batch_size x seqlen x num_heads
             std::optional<at::Tensor> out_,        // batch_size x seqlen x num_heads x head_size
             std::optional<at::ScalarType> out_dtype_
             ) {
