@@ -302,8 +302,7 @@ public:
         // Load sinks [H_q] to smem
         const bool has_sink = params.mainloop.ptr_sink != nullptr;
         const int num_heads = get<2>(params.mainloop.shape_Q);
-        Shape<int> layout_sink = make_shape(num_heads);
-        Tensor gSink = make_tensor(make_gmem_ptr(params.mainloop.ptr_sink), layout_sink);
+        Tensor gSink = make_tensor(make_gmem_ptr(params.mainloop.ptr_sink), make_shape(num_heads));
         Tensor sSink = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_sink.data()), SmemLayoutSink{});
         if (has_sink) {
             #pragma unroll
