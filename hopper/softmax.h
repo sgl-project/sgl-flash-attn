@@ -159,19 +159,18 @@ struct Softmax {
         SumOp<float> sum_op;
         quad_allreduce_(row_sum, row_sum, sum_op);
 
-        if (has_sink) {
-            #pragma unroll
-            for (int mi = 0; mi < size(row_sum); ++mi) {
-                float const max_scaled = row_max(mi) * softmax_scale_log2 - float(Max_offset);
-                float const extra = exp2f(row_sink(mi) * softmax_scale_log2 - max_scaled);
-                row_sum(mi) += extra;
-            }
-        }
-
         TensorT scores_scale;
         #pragma unroll
         for (int mi = 0; mi < size(row_sum); ++mi) {
+            if (row_max(mi) == -INFINITY) { row_max(mi) = 0.f; }
+            
             float sum = row_sum(mi);
+            if (has_sink) {
+                const float max_scaled = row_max(mi) * softmax_scale_log2 - Max_offset;
+                float const extra = exp2f(float(M_LOG2E) * row_sink(mi) - max_scaled);
+                sum += extra;
+            }
+            
             float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
             scores_scale(mi) = inv_sum * final_scale;
             // For FP8, we might have scaled the output of exp by 2**8 so we need to divide sum by that amount.

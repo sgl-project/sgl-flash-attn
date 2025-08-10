@@ -1091,7 +1091,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     if(sinks_.has_value()) {
         auto sinks = sinks_.value();
         TORCH_CHECK(sinks.scalar_type() == at::ScalarType::BFloat16,
-            "We only support bf16 dtype for S extra.");
+            "sinks must have dtype bfloat16");
         CHECK_DEVICE(sinks);
         CHECK_SHAPE(sinks, num_heads);
         CHECK_CONTIGUOUS(sinks);
