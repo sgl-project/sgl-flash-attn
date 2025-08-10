@@ -89,12 +89,14 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int kNRows, int Max_offset=0>
+template <int kNRows, int Max_offset=0, bool Has_sink=false>
 struct Softmax {
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
     TensorT row_max, row_sum;
     float const softmax_scale_log2;
+
+    TensorT row_sink;
 
     CUTLASS_DEVICE Softmax(float const softmax_scale_log2_) : softmax_scale_log2(softmax_scale_log2_) {};
 
@@ -123,6 +125,23 @@ struct Softmax {
         return scores_scale;
     };
 
+    template<bool Is_packGQA, typename Tensor0>
+    __forceinline__ __device__ void set_row_sink(Tensor0 &sSink, int bidh, int qhead_per_khead = 0, int row_start = 0, int row_step = 0) {
+        if constexpr (!Is_packGQA) {
+            #pragma unroll
+            for(int mi = 0; mi < size(row_sink); ++mi) {
+                row_sink(mi) = static_cast<float>(sSink(bidh));
+            }
+        } else {
+            #pragma unroll
+            for(int mi = 0; mi < size(row_sink); ++mi) {
+                int row   = row_start + mi * row_step;
+                int head  = bidh * qhead_per_khead + row % qhead_per_khead; 
+                row_sink(mi) = static_cast<float>(sSink(head));
+            }
+        }
+    }
+
     template<bool Is_first, bool Check_inf=false, typename Tensor0>
     __forceinline__ __device__ void online_softmax(Tensor0 &acc_s) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
@@ -137,6 +156,16 @@ struct Softmax {
     __forceinline__ __device__ TensorT finalize(float const final_scale=1.f) {
         SumOp<float> sum_op;
         quad_allreduce_(row_sum, row_sum, sum_op);
+
+        if constexpr (Has_sink) {
+            #pragma unroll
+            for (int mi = 0; mi < size(row_sum); ++mi) {
+                float const max_scaled = row_max(mi) * softmax_scale_log2 - float(Max_offset);
+                float const extra = exp2f(row_sink(mi) * softmax_scale_log2 - max_scaled);
+                row_sum(mi) += extra;
+            }
+        }
+
         TensorT scores_scale;
         #pragma unroll
         for (int mi = 0; mi < size(row_sum); ++mi) {
