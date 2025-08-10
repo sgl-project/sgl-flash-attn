@@ -446,8 +446,12 @@ public:
                             auto thread_mma_qk = tiled_mma_qk.get_thread_slice(threadIdx.x - MmaThreadOffset);
                             Tensor coord_S = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
                             Tensor tCoord_S = thread_mma_qk.partition_C(coord_S);
-                            const int row_start = m_block * kBlockM + get<0>(tCoord_S(_0{}, _0{}));
-                            const int row_step = get<0>(tCoord_S(_1{}, _0{})) - get<0>(tCoord_S(_0{}, _0{}));
+                            auto tCoord_rowcol = make_tensor(
+                                tCoord_S.data(),
+                                flash::convert_layout_acc_rowcol</*Transposed=*/false>(tCoord_S.layout())
+                            );
+                            const int row_start = m_block * kBlockM + get<0>(tCoord_rowcol(_0{}, _0{}));
+                            const int row_step = get<0>(tCoord_rowcol(_1{}, _0{})) - get<0>(tCoord_rowcol(_0{}, _0{}));
                             softmax.template set_row_sink</*Is_packGQA=*/PackGQA>(sSink, bidh, qhead_per_khead, row_start, row_step);
                         }
                     }
