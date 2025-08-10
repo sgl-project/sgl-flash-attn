@@ -664,7 +664,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<at::Tensor> &scheduler_metadata_,  // (b + 1)
         int num_splits,
         std::optional<bool> pack_gqa_,
-        int const sm_margin
+        int const sm_margin,
+        std::optional<const at::Tensor> &sinks_ // (h)
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1085,6 +1086,18 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         } else {
             params.v_descale_ptr = nullptr;
         }
+    }
+
+    if(sinks_.has_value()) {
+        auto sinks = sinks_.value();
+        TORCH_CHECK(sinks.scalar_type() == at::ScalarType::BFloat16,
+            "We only support bf16 dtype for S extra.");
+        CHECK_DEVICE(sinks);
+        CHECK_SHAPE(sinks, num_heads);
+        CHECK_CONTIGUOUS(sinks);
+        params.sink_ptr = sinks.data_ptr();
+    } else {
+        params.sink_ptr = nullptr;
     }
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL

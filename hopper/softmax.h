@@ -89,13 +89,14 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int kNRows, int Max_offset=0, bool Has_sink=false>
+template <int kNRows, int Max_offset=0>
 struct Softmax {
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
     TensorT row_max, row_sum;
     float const softmax_scale_log2;
 
+    bool has_sink = false;
     TensorT row_sink;
 
     CUTLASS_DEVICE Softmax(float const softmax_scale_log2_) : softmax_scale_log2(softmax_scale_log2_) {};
@@ -127,6 +128,7 @@ struct Softmax {
 
     template<bool Is_packGQA, typename Tensor0>
     __forceinline__ __device__ void set_row_sink(Tensor0 &sSink, int bidh, int qhead_per_khead = 0, int row_start = 0, int row_step = 0) {
+        has_sink = true;
         if constexpr (!Is_packGQA) {
             #pragma unroll
             for(int mi = 0; mi < size(row_sink); ++mi) {
@@ -157,7 +159,7 @@ struct Softmax {
         SumOp<float> sum_op;
         quad_allreduce_(row_sum, row_sum, sum_op);
 
-        if constexpr (Has_sink) {
+        if (has_sink) {
             #pragma unroll
             for (int mi = 0; mi < size(row_sum); ++mi) {
                 float const max_scaled = row_max(mi) * softmax_scale_log2 - float(Max_offset);

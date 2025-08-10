@@ -63,6 +63,7 @@ public:
     using MainloopArguments = typename CollectiveMainloop::Arguments;
     using MainloopParams = typename CollectiveMainloop::Params;
     using BarrierQ = std::conditional_t<Use_TMA_Q, cutlass::arch::ClusterTransactionBarrier, cutlass::arch::ClusterBarrier>;
+    using SmemLayoutSink = typename CollectiveMainloop::SmemLayoutSink;
 
     // Epilogue derived types
     using EpilogueArguments = typename CollectiveEpilogue::Arguments;
@@ -299,11 +300,11 @@ public:
         CollectiveEpilogue epilogue;
 
         // Load sinks [H_q] to smem
+        const bool has_sink = params.mainloop.ptr_sink != nullptr;
         const int num_heads = get<2>(params.mainloop.shape_Q);
         Shape<int> layout_sink = make_shape(num_heads);
         Tensor gSink = make_tensor(make_gmem_ptr(params.mainloop.ptr_sink), layout_sink);
-        Tensor sSink = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_sink.data()), layout_sink);
-        const bool has_sink = params.mainloop.ptr_sink != nullptr;
+        Tensor sSink = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_sink.data()), SmemLayoutSink{});
         if (has_sink) {
             #pragma unroll
             for (int i = threadIdx.x; i < num_heads; i += blockDim.x) {
@@ -430,7 +431,7 @@ public:
                     softmax_scale_log2 *= q_descale * k_descale;
                 }
                 
-                flash::Softmax<!LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2, /*Max_offset=*/!Is_FP8 ? 0 : 8, /*Has_sink=*/has_sink> softmax(softmax_scale_log2);
+                flash::Softmax<!LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2, /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
 
                 if (has_sink) {
                     int const split_idx = get<3>(block_coord);
