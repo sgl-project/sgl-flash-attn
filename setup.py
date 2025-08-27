@@ -63,7 +63,7 @@ SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
-
+SKIP_CK_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CK_BUILD", "TRUE") == "TRUE" if USE_TRITON_ROCM else False
 
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
@@ -121,7 +121,7 @@ def check_if_rocm_home_none(global_option: str) -> None:
 
 
 def append_nvcc_threads(nvcc_extra_args):
-    nvcc_threads = os.getenv("NVCC_THREADS") or "2"
+    nvcc_threads = os.getenv("NVCC_THREADS") or "4"
     return nvcc_extra_args + ["--threads", nvcc_threads]
 
 
@@ -132,7 +132,7 @@ def rename_cpp_to_cu(cpp_files):
 
 def validate_and_update_archs(archs):
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942"]
+    allowed_archs = ["native", "gfx90a", "gfx950", "gfx942"]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -146,11 +146,12 @@ ext_modules = []
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if os.path.isdir(".git"):
-    subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
-    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
+    if not SKIP_CK_BUILD:
+        subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
+        subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
 else:
     if IS_ROCM:
-        if not USE_TRITON_ROCM:
+        if not SKIP_CK_BUILD:
             assert (
                 os.path.exists("csrc/composable_kernel/example/ck_tile/01_fmha/generate.py")
             ), "csrc/composable_kernel is missing, please use source distribution or git clone"
@@ -194,6 +195,34 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
+
+    nvcc_flags = [
+    "-O3",
+    "-std=c++17",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--use_fast_math",
+    # "--ptxas-options=-v",
+    # "--ptxas-options=-O2",
+    # "-lineinfo",
+    # "-DFLASHATTENTION_DISABLE_BACKWARD",
+    # "-DFLASHATTENTION_DISABLE_DROPOUT",
+    # "-DFLASHATTENTION_DISABLE_ALIBI",
+    # "-DFLASHATTENTION_DISABLE_SOFTCAP",
+    # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+    # "-DFLASHATTENTION_DISABLE_LOCAL",
+    ]
+
+    compiler_c17_flag=["-O3", "-std=c++17"]
+    # Add Windows-specific flags
+    if sys.platform == "win32" and os.getenv('DISTUTILS_USE_SDK') == '1':
+        nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
+        compiler_c17_flag=["-O2", "/std:c++17", "/Zc:__cplusplus"]
+
     ext_modules.append(
         CUDAExtension(
             name="flash_attn_2_cuda",
@@ -207,8 +236,6 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim160_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim160_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim192_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim192_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim256_fp16_sm80.cu",
@@ -221,8 +248,6 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_hdim96_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim128_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim128_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim160_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim160_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim192_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim192_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim256_fp16_causal_sm80.cu",
@@ -239,8 +264,6 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_bwd_hdim96_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim128_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim128_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim160_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim160_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim192_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim192_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim256_fp16_sm80.cu",
@@ -253,8 +276,6 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_bwd_hdim96_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim128_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim128_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim160_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim160_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim192_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim192_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim256_fp16_causal_sm80.cu",
@@ -267,8 +288,6 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_split_hdim96_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim128_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim160_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim160_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim192_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim192_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_sm80.cu",
@@ -281,38 +300,14 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_split_hdim96_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim128_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim160_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim160_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim192_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim192_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu",
             ],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
-                "nvcc": append_nvcc_threads(
-                    [
-                        "-O3",
-                        "-std=c++17",
-                        "-U__CUDA_NO_HALF_OPERATORS__",
-                        "-U__CUDA_NO_HALF_CONVERSIONS__",
-                        "-U__CUDA_NO_HALF2_OPERATORS__",
-                        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                        "--expt-relaxed-constexpr",
-                        "--expt-extended-lambda",
-                        "--use_fast_math",
-                        # "--ptxas-options=-v",
-                        # "--ptxas-options=-O2",
-                        # "-lineinfo",
-                        # "-DFLASHATTENTION_DISABLE_BACKWARD",
-                        # "-DFLASHATTENTION_DISABLE_DROPOUT",
-                        # "-DFLASHATTENTION_DISABLE_ALIBI",
-                        # "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                        # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-                        # "-DFLASHATTENTION_DISABLE_LOCAL",
-                    ]
-                    + cc_flag
-                ),
+                "cxx": compiler_c17_flag,
+                "nvcc": append_nvcc_threads(nvcc_flags + cc_flag),
             },
             include_dirs=[
                 Path(this_dir) / "csrc" / "flash_attn",
@@ -326,20 +321,19 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
-    if USE_TRITON_ROCM:
-        # Skip C++ extension compilation if using Triton Backend
-        pass
-    else:
+    # Skips CK C++ extension compilation if using Triton Backend
+    if not SKIP_CK_BUILD:
         ck_dir = "csrc/composable_kernel"
 
         #use codegen get code dispatch
         if not os.path.exists("./build"):
             os.makedirs("build")
 
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2"], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2"], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2"], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2"], check=True)
+        optdim = os.getenv("OPT_DIM", "32,64,128,256")
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
@@ -352,7 +346,11 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         archs = os.getenv("GPU_ARCHS", "native").split(";")
         validate_and_update_archs(archs)
 
-        cc_flag = [f"--offload-arch={arch}" for arch in archs]
+        if archs != ['native']:
+            cc_flag = [f"--offload-arch={arch}" for arch in archs]
+        else:
+            arch = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
+            cc_flag = [f"--offload-arch={arch}"]
 
         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
         # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -399,6 +397,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = get_hip_version()
+        if hip_version > Version('5.5.00000'):
+            cc_flag += ["-mllvm", "--lsr-drop-solution=1"]
         if hip_version > Version('5.7.23302'):
             cc_flag += ["-fno-offload-uniform-block"]
         if hip_version > Version('6.1.40090'):
