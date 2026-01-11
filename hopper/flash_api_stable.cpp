@@ -210,6 +210,10 @@ void set_params_fprop(Flash_fwd_params &params,
     #ifdef FLASHATTENTION_DISABLE_LOCAL
         STD_TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
     #endif
+
+    // Initialize sparse mask to disabled (default)
+    params.use_sparse_mask = false;
+    params.sparse_mask_fine = nullptr;
 }
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -754,7 +758,8 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
         int64_t sm_margin,
-        std::optional<const at::Tensor> &sinks_ // (h)
+        std::optional<const at::Tensor> &sinks_, // (h)
+        std::optional<at::Tensor> sparse_mask_fine_   // [total_q, max_k_blocks, num_int32_per_block]
         ) {
 
     auto dprops = get_device_prop();
@@ -1223,6 +1228,40 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     #ifdef FLASHATTENTION_DISABLE_APPENDKV
     STD_TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
     #endif
+
+    // Handle sparse mask for Masked MHA (topk-based sparse attention)
+    if (sparse_mask_fine_.has_value()) {
+        auto sparse_mask_fine = sparse_mask_fine_.value();
+        TORCH_CHECK(sparse_mask_fine.dtype() == torch::kInt32, "sparse_mask_fine must have dtype int32");
+        CHECK_CONTIGUOUS(sparse_mask_fine);
+
+        // sparse_mask_fine: [total_q, max_k_blocks, num_int64_per_block]
+        // Row stride (max_k_blocks * num_int64_per_block) must be multiple of 16 for TMA 128-byte alignment
+        TORCH_CHECK(sparse_mask_fine.dim() == 3, "sparse_mask_fine must be 3D");
+        TORCH_CHECK(sparse_mask_fine.size(0) == total_q, "sparse_mask_fine dim 0 must match total_q");
+        TORCH_CHECK((sparse_mask_fine.size(1) * sparse_mask_fine.size(2) * sizeof(int)) % 128 == 0,
+            "sparse_mask_fine row stride (max_k_blocks * num_int32_per_block * sizeof(int)) must be multiple of 128 for TMA alignment");
+
+        params.use_sparse_mask = true;
+        params.sparse_mask_fine = sparse_mask_fine.data_ptr<int>();
+        params.sparse_mask_max_k_blocks = sparse_mask_fine.size(1);
+        params.sparse_mask_fine_k_stride = sparse_mask_fine.stride(1);
+        params.sparse_mask_fine_q_stride = sparse_mask_fine.stride(0);
+
+        // Get kBlockM and kBlockN from tile_size
+        auto kBlockMN = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local,
+                                           params.is_e4m3 ? 1 : 2, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f);
+        params.sparse_mask_k_block_size = std::get<1>(kBlockMN);  // kBlockN
+        params.sparse_mask_q_tile_size = std::get<0>(kBlockMN);   // kBlockM
+
+        // Sparse mask constraints
+        TORCH_CHECK(params.arch >= 90, "Sparse mask is only supported on SM90+ (Hopper)");
+        TORCH_CHECK(is_varlen, "Sparse mask requires varlen mode (cu_seqlens_q must be provided)");
+        #ifdef FLASHATTENTION_DISABLE_SPARSE_MASK
+        TORCH_CHECK(false, "This flash attention build does not support sparse mask.");
+        #endif
+    }
+
 
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
         auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
