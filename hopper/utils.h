@@ -239,6 +239,15 @@ void cp_async_wait() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <typename TS, typename TD>
+CUTE_HOST_DEVICE
+void cp_async_ca_zfill(TD* smem_ptr, TS const* gmem_ptr, bool pred) {
+    SM80_CP_ASYNC_CACHEALWAYS_ZFILL<TS, TD>::copy(*gmem_ptr, *smem_ptr, pred);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
 template <bool A, class Mma, class Tensor0>
 CUTLASS_DEVICE
 auto mma_partition_fragment_AB(Mma const& mma, Tensor0 const& tensor0) {

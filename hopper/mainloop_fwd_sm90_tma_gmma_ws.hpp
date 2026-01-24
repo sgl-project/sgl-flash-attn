@@ -30,7 +30,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSink_>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSink_, bool Has_sparse_mask_=false>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -53,6 +53,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
+    static constexpr bool Has_sparse_mask = Has_sparse_mask_;
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
     static constexpr bool Use_TMA_Q = !PackGQA;
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
@@ -69,6 +70,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+    static constexpr int kNumInt32PerBlock = (kBlockN + 31) / 32;
 
     using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
     using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
@@ -277,16 +279,37 @@ struct CollectiveMainloopFwdSm90 {
         ClusterShape{}));
     using TMA_Qv = std::conditional_t<HasQv, TMA_Qv_, std::nullptr_t>;
 
+    // Mask shape: (total_q, max_k_blocks * num_int32_per_block)
+    using ShapeMask = cute::Shape<int32_t, int32_t>;
+    using StrideMask = cute::Stride<int64_t, _1>;
+    // Simple row-major layout for mask in smem: (kBlockM, kNumInt32PerBlock, kStages)
+    using SmemLayoutMask = Layout<Shape<Int<kBlockM>, Int<kNumInt32PerBlock>, Int<kStages>>,
+                                   Stride<Int<kNumInt32PerBlock>, _1, Int<kBlockM * kNumInt32PerBlock>>>;
+    using TMA_Mask_ = decltype(make_tma_copy(
+        SM90_TMA_LOAD{},
+        make_tensor(make_gmem_ptr(static_cast<int32_t const*>(nullptr)), ShapeMask{}, StrideMask{}),
+        take<0, 2>(SmemLayoutMask{}),
+        Shape<Int<kBlockM>, Int<kNumInt32PerBlock>>{},
+        _1{}));
+    using TMA_Mask = std::conditional_t<Has_sparse_mask && Use_TMA_KV, TMA_Mask_, std::nullptr_t>;
+
     // Set the bytes transferred in this TMA transaction (may involve multiple issues)
     static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutVt{})) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesQv = static_cast<uint32_t>(size(SmemLayoutQv{}) * cutlass::sizeof_bits_v<Element> / 8);
+    static constexpr uint32_t TmaTransactionBytesMask = static_cast<uint32_t>(kBlockM * kNumInt32PerBlock * sizeof(int));
+
+    // Whether to use TMA for loading mask (same condition as K/V TMA)
+    static constexpr bool Use_TMA_Mask = Use_TMA_KV && Has_sparse_mask;
 
     using PipelineTmaAsync = std::conditional_t<CUTE_STATIC_V(size(ClusterShape{})) == 1, typename cutlass::PipelineTmaAsyncNoCluster<kStages>, typename cutlass::PipelineTmaAsync<kStages>>;
+    // For mask, we don't need cluster multicast, so always use PipelineTmaAsyncNoCluster
+    using PipelineTmaAsyncMask = typename cutlass::PipelineTmaAsyncNoCluster<kStages>;
     using MainloopPipelineK = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
     using MainloopPipelineV = std::conditional_t<!Transpose_V && Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
     using MainloopPipelineVt = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
+    using MainloopPipelineMask = std::conditional_t<Use_TMA_Mask, PipelineTmaAsyncMask, typename cutlass::PipelineAsync<kStages>>;
     // We always use TMA for K_new and V_new
     using MainloopPipelineKVNew = PipelineTmaAsync;
     using PipelineState = cutlass::PipelineState<kStages>;
@@ -305,6 +328,7 @@ struct CollectiveMainloopFwdSm90 {
     using SmemP_t = std::conditional_t<MmaPV_is_RS, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutP>, SmemAlignmentP>>;
     using SmemScale_t = std::conditional_t<!LargeHeadDimV, cute::array<float, 0>, cute::array_aligned<float, cute::cosize_v<SmemLayoutScale>, 128>>;
     using SmemQv_t = std::conditional_t<!HasQv, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutQv>, SmemAlignmentQv>>;
+    using SmemMask_t = std::conditional_t<!Has_sparse_mask, cute::array<int, 0>, cute::array_aligned<int, kStages * kBlockM * kNumInt32PerBlock, 128>>;
     // Sometimes even with SmemP_t = cute::array<Element, 0>, putting it in the TensorStorage struct causes
     // smem size to go from 227KB to 228KB and we get "invalid argument".
 
@@ -314,6 +338,7 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
         SmemQv_t smem_qv;
         cute::array_aligned<ElementSink, cute::cosize_v<SmemLayoutSink>, 128> smem_sink;
+        SmemMask_t smem_mask;
     };
 
     struct TensorStorageWithPNoTranspose : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose, SmemAlignmentP), _0> {
@@ -323,6 +348,7 @@ struct CollectiveMainloopFwdSm90 {
         SmemQv_t smem_qv;
         SmemP_t smem_p;
         cute::array_aligned<ElementSink, cute::cosize_v<SmemLayoutSink>, 128> smem_sink;
+        SmemMask_t smem_mask;
     };
     struct TensorStorageWithPScaleNoTranspose : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose, SmemAlignmentP), _0> {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVtNoTranspose> smem_v;
@@ -332,6 +358,7 @@ struct CollectiveMainloopFwdSm90 {
         SmemP_t smem_p;
         SmemScale_t smem_scale;
         cute::array_aligned<ElementSink, cute::cosize_v<SmemLayoutSink>, 128> smem_sink;
+        SmemMask_t smem_mask;
     };
 
     using TensorStorageNoTranspose = std::conditional_t<
@@ -351,6 +378,7 @@ struct CollectiveMainloopFwdSm90 {
         SmemQv_t smem_qv;
         SmemScale_t smem_scale;
         cute::array_aligned<ElementSink, cute::cosize_v<SmemLayoutSink>, 128> smem_sink;
+        SmemMask_t smem_mask;
     };
 
     using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose, TensorStorageTransposeV>;
@@ -404,6 +432,11 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         ElementSink const* const ptr_sink = nullptr;
+        int const* sparse_mask_fine = nullptr;       // [total_q, max_k_blocks, num_int32_per_block] bitmap
+        int sparse_mask_max_k_blocks = 0;            // ceil(max_seqlen_k / kBlockN)
+        int sparse_mask_fine_q_stride = 0;           // = max_k_blocks * num_int32_per_block
+        int sparse_mask_fine_k_stride = 0;           // = num_int32_per_block
+        int total_q = 0;                             // total number of Q positions (for TMA Mask)
     };
 
     // Device side kernel params
@@ -446,6 +479,7 @@ struct CollectiveMainloopFwdSm90 {
         TMA_K tma_load_K_new;
         TMA_V tma_load_V_new;
         TMA_Qv tma_load_Qv;
+        TMA_Mask tma_load_Mask;
         float const softmax_scale_log2;
         float const* ptr_q_descale, *ptr_k_descale, *ptr_v_descale;
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
@@ -462,6 +496,11 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
         ElementSink const* const ptr_sink = nullptr;
+        int const* sparse_mask_fine = nullptr;              // [total_q, max_k_blocks, num_int32_per_block] bitmap
+        int sparse_mask_max_k_blocks = 0;                   // ceil(max_seqlen_k / kBlockN)
+        int sparse_mask_fine_q_stride = 0;                  // = max_k_blocks * num_int32_per_block
+        int sparse_mask_fine_k_stride = 0;                  // = num_int32_per_block
+        int total_q = 0;                                    // total number of Q positions (for TMA Mask)
     };
 
     static Params
@@ -519,6 +558,27 @@ struct CollectiveMainloopFwdSm90 {
                 return nullptr;
             }
         }();
+        // Create TMA descriptor for mask if Has_sparse_mask and Use_TMA_KV
+        TMA_Mask tma_load_Mask = [&] {
+            if constexpr (Has_sparse_mask && Use_TMA_KV) {
+                // Mask shape: (total_q, max_k_blocks * num_int32_per_block)
+                // total_q is the first dimension, sparse_mask_fine_q_stride is the row stride
+                auto shape_Mask = make_shape(
+                    static_cast<int32_t>(args.total_q),                      // total_q rows
+                    static_cast<int32_t>(args.sparse_mask_fine_q_stride)     // max_k_blocks * num_int32_per_block cols
+                );
+                auto stride_Mask = make_stride(args.sparse_mask_fine_q_stride, Int<1>{});
+                Tensor mMask = make_tensor(make_gmem_ptr(args.sparse_mask_fine), shape_Mask, stride_Mask);
+                return make_tma_copy(
+                    SM90_TMA_LOAD{},
+                    mMask,
+                    take<0, 2>(SmemLayoutMask{}),
+                    Shape<Int<kBlockM>, Int<kNumInt32PerBlock>>{},
+                    _1{});  // no multicast for mask
+            } else {
+                return nullptr;
+            }
+        }();
         // If PackGQA, reshape Q to be ((qhead_per_khead, seqlen_q), head_size, nhead_k, batch_size)
         int const qhead_per_khead = !PackGQA ? 1 : cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K));
         auto const shape_Q_packed = cute::conditional_return<!PackGQA>(
@@ -564,7 +624,7 @@ struct CollectiveMainloopFwdSm90 {
                 cutlass::FastDivmod(page_size),  // page_size_divmod
                 cutlass::FastDivmod(!args.ptr_pagetable ? 1 : cute::ceil_div(page_size, kBlockN)),  // blockN_per_page_size_divmod
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
-                tma_load_Q, tma_load_K, tma_load_V, tma_load_K_new, tma_load_V_new, tma_load_Qv,
+                tma_load_Q, tma_load_K, tma_load_V, tma_load_K_new, tma_load_V_new, tma_load_Qv, tma_load_Mask,
                 !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
                 args.ptr_q_descale, args.ptr_k_descale, args.ptr_v_descale,
                 args.stride_q_descale, args.stride_k_descale, args.stride_v_descale,
@@ -573,7 +633,11 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary, args.ptr_sink};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary, args.ptr_sink,
+                args.sparse_mask_fine,
+                args.sparse_mask_max_k_blocks,
+                args.sparse_mask_fine_q_stride, args.sparse_mask_fine_k_stride,
+            };
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -593,6 +657,9 @@ struct CollectiveMainloopFwdSm90 {
             cute::prefetch_tma_descriptor(params.tma_load_K_new.get_tma_descriptor());
             cute::prefetch_tma_descriptor(params.tma_load_V_new.get_tma_descriptor());
         }
+        if constexpr (Use_TMA_Mask) {
+            cute::prefetch_tma_descriptor(params.tma_load_Mask.get_tma_descriptor());
+        }
     }
 
     template <typename SchedulerPrefetch, typename SharedStorage>
@@ -601,6 +668,7 @@ struct CollectiveMainloopFwdSm90 {
          MainloopPipelineK pipeline_k,
          MainloopPipelineV pipeline_v,
          MainloopPipelineVt pipeline_vt,
+         MainloopPipelineMask pipeline_mask,
          PipelineState& smem_pipe_write,
          SharedStorage &shared_storage,
          SchedulerPrefetch const& scheduler_prefetch,
@@ -755,6 +823,79 @@ struct CollectiveMainloopFwdSm90 {
             }
         }
 
+        // Set up TMA for Mask loading
+        Tensor sMask = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_mask.data()), SmemLayoutMask{});
+        auto tMaskgMask_tMasksMask_tuple = [&] {
+            if constexpr (Use_TMA_Mask) {
+                // For TMA, we create tensor views using the TMA descriptor
+                // The mask is laid out as (total_q, max_k_blocks * num_int32_per_block) in gmem
+                // We load tile of (kBlockM, kNumInt32PerBlock) at a time
+                auto shape_Mask_gmem = make_shape(
+                    static_cast<int32_t>(params.total_q),                     // total_q rows (must match TMA descriptor)
+                    static_cast<int32_t>(params.sparse_mask_fine_q_stride)    // total cols = max_k_blocks * num_int32_per_block
+                );
+                Tensor mMask_TMA = params.tma_load_Mask.get_tma_tensor(shape_Mask_gmem);
+                // Apply offset for this Q block
+                Tensor gMask_TMA = local_tile(
+                    domain_offset(make_coord(seqlen_info.offset_q, _0{}), mMask_TMA),
+                    Shape<Int<kBlockM>, Int<kNumInt32PerBlock>>{},
+                    make_coord(_, _)  // (m_block, n_block * kNumInt32PerBlock offset)
+                );
+                auto block_tma_Mask = params.tma_load_Mask.get_slice(_0{});
+                Tensor tMaskgMask = group_modes<0, 3>(block_tma_Mask.partition_S(gMask_TMA));  // (TMA, m_block, k_offset)
+                Tensor tMasksMask = group_modes<0, 3>(block_tma_Mask.partition_D(sMask));  // (TMA, PIPE)
+                return cute::make_tuple(tMaskgMask, tMasksMask);
+            } else {
+                return cute::make_tuple(nullptr, nullptr);
+            }
+        }();
+        auto tMaskgMask_TMA = cute::get<0>(tMaskgMask_tMasksMask_tuple);
+        auto tMasksMask_TMA = cute::get<1>(tMaskgMask_tMasksMask_tuple);
+
+        auto load_Mask = [&] (int const m_block, int const n_block, auto const& smem_pipe_write) {
+            if constexpr (!Has_sparse_mask) {
+                return;
+            } else if constexpr (Use_TMA_Mask) {
+                // TMA path: single thread triggers TMA load
+                pipeline_mask.producer_acquire(smem_pipe_write);
+                copy(params.tma_load_Mask.with(*pipeline_mask.producer_get_barrier(smem_pipe_write), 0 /*mcast_mask*/, TMA::CacheHintSm90::EVICT_FIRST),
+                    tMaskgMask_TMA(_, m_block, n_block), tMasksMask_TMA(_, smem_pipe_write.index()));
+            } else {
+                // cp.async path
+                pipeline_mask.producer_acquire(smem_pipe_write);
+
+                int* stage_smem_base = shared_storage.tensors.mainloop.smem_mask.data() +
+                                        smem_pipe_write.index() * (kBlockM * kNumInt32PerBlock);
+
+                int const* src_base_common = params.sparse_mask_fine +
+                                                n_block * params.sparse_mask_fine_k_stride +
+                                                (seqlen_info.offset_q + m_block * kBlockM) * params.sparse_mask_fine_q_stride;
+
+                constexpr int total_elems = kBlockM * kNumInt32PerBlock;
+
+                int const block_row_start = m_block * kBlockM;
+
+                #pragma unroll
+                for (int i = thread_idx; i < total_elems; i += NumProducerThreads) {
+
+                    int const row_offset = i / kNumInt32PerBlock;
+                    int const word_idx   = i % kNumInt32PerBlock;
+
+                    int const row_logic = block_row_start + row_offset;
+                    bool const valid = (row_logic < seqlen_info.seqlen_q);
+
+                    int const* src = src_base_common +
+                                        row_offset * params.sparse_mask_fine_q_stride +
+                                        word_idx;
+
+                    flash::cp_async_ca_zfill(stage_smem_base + i, src, valid);
+                }
+
+                flash::cp_async_fence();
+                pipeline_mask.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+            }
+        };
+
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
             pipeline_k.producer_acquire(smem_pipe_write);
             if constexpr (!PagedKVNonTMA) {
@@ -818,6 +959,15 @@ struct CollectiveMainloopFwdSm90 {
             // if (thread_idx == 0) { printf("Producer: main load, after load K, index = %d\n", smem_pipe_write.index());}
         }
 
+        if constexpr (Has_sparse_mask) {
+            // TMA path: should_load_KV thread triggers the load; cp.async path: all threads participate
+            if constexpr (Use_TMA_Mask) {
+                if (should_load_KV) { load_Mask(m_block, n_block, smem_pipe_write); }
+            } else {
+                load_Mask(m_block, n_block, smem_pipe_write);
+            }
+        }
+
         if constexpr (Use_TMA_Q) {
             // Wait for the MMA warpgroups to signal that smem_q is ready
             if (SingleProducerWarp || warp_idx_in_warpgroup == 0) {
@@ -866,7 +1016,7 @@ struct CollectiveMainloopFwdSm90 {
         }
         int n_block_prev = n_block;
         --n_block;
-        #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)
+        #pragma unroll (!Transpose_V && Use_TMA_KV && !Has_sparse_mask ? 2 : 1)
         for (; n_block >= n_block_min; --n_block) {
             PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
             ++smem_pipe_write;
@@ -886,6 +1036,14 @@ struct CollectiveMainloopFwdSm90 {
                     }
                 }
             }
+            if constexpr (Has_sparse_mask) {
+                // TMA path: should_load_KV thread triggers the load; cp.async path: all threads participate
+                if constexpr (Use_TMA_Mask) {
+                    if (should_load_KV) { load_Mask(m_block, n_block, smem_pipe_write); }
+                } else {
+                    load_Mask(m_block, n_block, smem_pipe_write);
+                }
+            }
             n_block_prev = n_block;
             if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
         }
@@ -901,7 +1059,7 @@ struct CollectiveMainloopFwdSm90 {
 
     template <typename SharedStorage>
     CUTLASS_DEVICE void
-    load_tail(MainloopPipelineK pipeline_k, MainloopPipelineV pipeline_v, MainloopPipelineVt pipeline_vt,
+    load_tail(MainloopPipelineK pipeline_k, MainloopPipelineV pipeline_v, MainloopPipelineVt pipeline_vt, MainloopPipelineMask pipeline_mask,
               PipelineState& smem_pipe_write, SharedStorage &shared_storage, int const work_idx) {
         // If we don't wait for barrier_O here, when using Cluster, CTA0 might exit early and CTA1 will
         // try to arrive on barrier_O of CTA0, causing "unspecified launch failure".
@@ -916,6 +1074,7 @@ struct CollectiveMainloopFwdSm90 {
             */
             pipeline_k.producer_tail(smem_pipe_write);
             pipeline_v.producer_tail(smem_pipe_write);
+            if constexpr (Has_sparse_mask) {pipeline_mask.producer_tail(smem_pipe_write);}
             if constexpr (Transpose_V) { pipeline_vt.producer_tail(smem_pipe_write); }
         }
     }
@@ -964,6 +1123,7 @@ struct CollectiveMainloopFwdSm90 {
     mma(Params const& params,
         MainloopPipelineK pipeline_k,
         MainloopPipelineV pipeline_v,
+        MainloopPipelineMask pipeline_mask,
         PipelineState& smem_pipe_read,
         FrgTensorO& tOrO,
         Softmax& softmax,
@@ -1073,6 +1233,14 @@ struct CollectiveMainloopFwdSm90 {
             params.attention_chunk_divmod, params.qhead_per_khead_divmod
         );
 
+        // Sparse mask for Masked MHA (topk-based sparse attention)
+        // Note: When Has_sparse_mask is true, we don't need causal mask since NSA indexer already ensures causality
+        [[maybe_unused]] flash::SparseMask<kBlockM, kBlockN, PackGQA, TiledMmaQK> sparse_mask(
+            thread_idx, seqlen_q, seqlen_k,
+            params.sparse_mask_max_k_blocks,
+            params.qhead_per_khead_divmod
+        );
+
         float softcap_val = params.softcap_val;
         if constexpr (Has_softcap && Is_FP8) {
             float const q_descale = params.ptr_q_descale == nullptr ? 1.0f : params.ptr_q_descale[bidb * get<0>(params.stride_q_descale) + bidh_kv * get<1>(params.stride_q_descale)];
@@ -1156,7 +1324,18 @@ struct CollectiveMainloopFwdSm90 {
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
             }
             scoremod_premask_fn(tSrS);
-            mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+            // Apply mask: use sparse_mask when Has_sparse_mask, otherwise use regular causal/local mask
+            if constexpr (Has_sparse_mask) {
+                consumer_wait(pipeline_mask, smem_pipe_read);
+                uint32_t const* mask_ptr = reinterpret_cast<uint32_t const*>(
+                    shared_storage.tensors.mainloop.smem_mask.data() +
+                    smem_pipe_read.index() * (kBlockM * kNumInt32PerBlock)
+                );
+                sparse_mask.template apply<true /*Seqlenk_mask*/>(tSrS, m_block, n_block, mask_ptr);
+                pipeline_mask.consumer_release(smem_pipe_read);
+            } else {
+                mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+            }
 
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
@@ -1199,7 +1378,13 @@ struct CollectiveMainloopFwdSm90 {
                     flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
                 }
                 scoremod_premask_fn(tSrS);
+                if constexpr (Has_sparse_mask) {
+                    consumer_wait(pipeline_mask, smem_pipe_read);
+                }
                 mask_fn(tSrS, n_block);
+                if constexpr (Has_sparse_mask) {
+                    pipeline_mask.consumer_release(smem_pipe_read); // release mask
+                }
                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
                 if constexpr (LargeHeadDimV) { store_scales(scores_scale, smem_pipe_read_v.index()); }
                 softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
@@ -1215,31 +1400,47 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             };
 
-            if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-                auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-                int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
-                    seqlen_info, m_block, n_block_min, params.window_size_right,
-                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
-                #pragma unroll 1
-                for (; n_block >= n_block_min_causal_local_mask; --n_block) {
-                    fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
-                }
-            }
-
-            int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
-                seqlen_info, m_block, n_block_min, params.window_size_left,
-                params.attention_chunk_divmod, params.qhead_per_khead_divmod);
-            auto no_mask_fn = [](auto& tSrS, int n_block) { };
-            #pragma unroll 1
-            for (; n_block >= n_block_min_before_local_mask; --n_block) {
-                fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
-            }
-            // Separate masking iterations on the left for local attention
-            if constexpr (Is_local) {
-                auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+            // When Has_sparse_mask is true, apply sparse_mask for all iterations
+            // (Is_causal and Is_local are both false in this case, so we need a separate branch)
+            if constexpr (Has_sparse_mask) {
+                auto sparse_mask_fn = [&](auto& tSrS, int n_block) {
+                    uint32_t const* mask_ptr = reinterpret_cast<uint32_t const*>(
+                        shared_storage.tensors.mainloop.smem_mask.data() +
+                        smem_pipe_read.index() * (kBlockM * kNumInt32PerBlock)
+                    );
+                    sparse_mask.template apply<false /*Seqlenk_mask*/>(tSrS, m_block, n_block, mask_ptr);
+                };
                 #pragma unroll 1
                 for (; n_block >= n_block_min; --n_block) {
-                    fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
+                    fwd_step(n_block, sparse_mask_fn, cute::true_type{} /*check_inf*/);
+                }
+            } else {
+                if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
+                    auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                    int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
+                        seqlen_info, m_block, n_block_min, params.window_size_right,
+                        params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+                    #pragma unroll 1
+                    for (; n_block >= n_block_min_causal_local_mask; --n_block) {
+                        fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
+                    }
+                }
+
+                int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
+                    seqlen_info, m_block, n_block_min, params.window_size_left,
+                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+                auto no_mask_fn = [](auto& tSrS, int n_block) { };
+                #pragma unroll 1
+                for (; n_block >= n_block_min_before_local_mask; --n_block) {
+                    fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
+                }
+                // Separate masking iterations on the left for local attention
+                if constexpr (Is_local) {
+                    auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+                    #pragma unroll 1
+                    for (; n_block >= n_block_min; --n_block) {
+                        fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
+                    }
                 }
             }
             // Tell producers that smem_q is ready
@@ -1261,7 +1462,6 @@ struct CollectiveMainloopFwdSm90 {
             ++smem_pipe_read;
 
         } else {  // No intra-WG overlap
-
             warp_scheduler_barrier_sync();
 
             auto fwd_step = [&](int const n_block, auto mask_fn, auto is_first_iter_type, auto check_inf_type) {
@@ -1288,7 +1488,13 @@ struct CollectiveMainloopFwdSm90 {
                     warpgroup_wait<0>();
                 }
                 scoremod_premask_fn(tSrS);
+                if constexpr (Has_sparse_mask) {
+                    consumer_wait(pipeline_mask, smem_pipe_read);
+                }
                 mask_fn(tSrS, n_block);
+                if constexpr (Has_sparse_mask) {
+                    pipeline_mask.consumer_release(smem_pipe_read); // release mask
+                }
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
@@ -1313,11 +1519,32 @@ struct CollectiveMainloopFwdSm90 {
                 pipeline_v.consumer_release(smem_pipe_read);  // release V
             };
 
-            auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+            // First iteration mask function: use sparse_mask when Has_sparse_mask
+            auto first_iter_mask_fn = [&](auto& tSrS, int n_block) {
+                if constexpr (Has_sparse_mask) {
+                    uint32_t const* mask_ptr = reinterpret_cast<uint32_t const*>(
+                        shared_storage.tensors.mainloop.smem_mask.data() +
+                        smem_pipe_read.index() * (kBlockM * kNumInt32PerBlock)
+                    );
+                    sparse_mask.template apply<true /*Seqlenk_mask*/>(tSrS, m_block, n_block, mask_ptr);
+                } else {
+                    mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+                }
+            };
             fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
             --n_block;
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-                auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                auto mask_fn = [&](auto& tSrS, int n_block) {
+                    if constexpr (Has_sparse_mask) {
+                        uint32_t const* mask_ptr = reinterpret_cast<uint32_t const*>(
+                            shared_storage.tensors.mainloop.smem_mask.data() +
+                            smem_pipe_read.index() * (kBlockM * kNumInt32PerBlock)
+                        );
+                        sparse_mask.template apply<false /*Seqlenk_mask*/>(tSrS, m_block, n_block, mask_ptr);
+                    } else {
+                        mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+                    }
+                };
                 int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
                     seqlen_info, m_block, n_block_min, params.window_size_right,
                     params.attention_chunk_divmod, params.qhead_per_khead_divmod);
