@@ -30,7 +30,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSink_>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSink_, int kBlockH_=1>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -51,10 +51,11 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool AppendKV = AppendKV_;
     static constexpr bool HasQv = HasQv_;
     static constexpr bool PackGQA = PackGQA_;
+    static constexpr bool PackGQA_TMA = PackGQA && kBlockH_ > 1;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
-    static constexpr bool Use_TMA_Q = !PackGQA;
+    static constexpr bool Use_TMA_Q = !PackGQA || PackGQA_TMA;
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
@@ -69,6 +70,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+    static constexpr int kBlockH = kBlockH_;
 
     using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
     using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
@@ -614,7 +616,10 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
-        auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
+        // Update seqlen_info using n_offset:
+        // offset_k -> offset_k + n_offset
+        // seqlen_k -> seqlen_k - n_offset
+        auto [n_block_min, n_block_max, n_offset] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod);
@@ -668,8 +673,9 @@ struct CollectiveMainloopFwdSm90 {
 
         Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
-        Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
-        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
+        // Now add n_offset to update KV gmem pointers
+        Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k + n_offset, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
+        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k + n_offset, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
 
         auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
         Tensor tQgQ = group_modes<0, 3>(block_tma_Q.partition_S(gQ));  // (TMA)
@@ -705,7 +711,7 @@ struct CollectiveMainloopFwdSm90 {
             params.ptr_K, params.shape_K, params.stride_K,
             params.ptr_V, params.headdim_v, params.stride_V,
             params.page_size_divmod, params.blockN_per_page_size_divmod,
-            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k, bidb_kv_idx
+            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k - n_offset, seqlen_info.leftpad_k + n_offset, bidb_kv_idx
         );
 
         // Set up for transposing V, only used if Transpose_V
@@ -983,7 +989,7 @@ struct CollectiveMainloopFwdSm90 {
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
-        auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
+        auto [n_block_min, n_block_max, n_offset] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod);
@@ -1065,7 +1071,11 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         int const seqlen_q = seqlen_info.seqlen_q;
-        int const seqlen_k = seqlen_info.seqlen_k;
+        // Compute actual seqlen_k for this mma worktile
+        int const seqlen_k = seqlen_info.seqlen_k - n_offset;
+        // Precompute m_idx_min and m_idx_max for mask helper inlining (seqlen_k already adjusted by n_offset)
+        int const m_idx_min = !PackGQA ? m_block * kBlockM : params.qhead_per_khead_divmod.divide(m_block * kBlockM);
+        int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : params.qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
         int n_block = n_block_max - 1;
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
@@ -1217,18 +1227,26 @@ struct CollectiveMainloopFwdSm90 {
 
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
                 auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-                int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
-                    seqlen_info, m_block, n_block_min, params.window_size_right,
-                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+                int n_block_min_causal_local_mask;
+                {
+                    int const n_idx_cm = m_idx_min + seqlen_k - seqlen_q;
+                    int n_idx_right = !Is_local ? n_idx_cm : n_idx_cm + params.window_size_right;
+                    if constexpr (Is_local) { if (params.attention_chunk_divmod.divisor > 0) { n_idx_right = std::min(n_idx_right, flash::round_up(params.attention_chunk_divmod, n_idx_cm)); } }
+                    n_block_min_causal_local_mask = std::max(n_block_min, n_idx_right / kBlockN);
+                }
                 #pragma unroll 1
                 for (; n_block >= n_block_min_causal_local_mask; --n_block) {
                     fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
                 }
             }
 
-            int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
-                seqlen_info, m_block, n_block_min, params.window_size_left,
-                params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+            int n_block_min_before_local_mask;
+            {
+                int const n_idx_bm = m_idx_max + seqlen_k - seqlen_q;
+                int n_idx_left = !Is_local ? n_idx_bm : n_idx_bm - params.window_size_left;
+                if constexpr (Is_local) { if (params.attention_chunk_divmod.divisor > 0) { n_idx_left = std::max(n_idx_left, flash::round_down(params.attention_chunk_divmod, n_idx_bm)); } }
+                n_block_min_before_local_mask = !Is_local ? n_block_min : std::max(n_block_min, cute::ceil_div(n_idx_left, kBlockN));
+            }
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {
@@ -1318,17 +1336,25 @@ struct CollectiveMainloopFwdSm90 {
             --n_block;
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
                 auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-                int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
-                    seqlen_info, m_block, n_block_min, params.window_size_right,
-                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+                int n_block_min_causal_local_mask;
+                {
+                    int const n_idx_cm = m_idx_min + seqlen_k - seqlen_q;
+                    int n_idx_right = !Is_local ? n_idx_cm : n_idx_cm + params.window_size_right;
+                    if constexpr (Is_local) { if (params.attention_chunk_divmod.divisor > 0) { n_idx_right = std::min(n_idx_right, flash::round_up(params.attention_chunk_divmod, n_idx_cm)); } }
+                    n_block_min_causal_local_mask = std::max(n_block_min, n_idx_right / kBlockN);
+                }
                 #pragma unroll 1
                 for (; n_block >= n_block_min_causal_local_mask; --n_block) {
                     fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
                 }
             }
-            int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
-                seqlen_info, m_block, n_block_min, params.window_size_left,
-                params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+            int n_block_min_before_local_mask;
+            {
+                int const n_idx_bm = m_idx_max + seqlen_k - seqlen_q;
+                int n_idx_left = !Is_local ? n_idx_bm : n_idx_bm - params.window_size_left;
+                if constexpr (Is_local) { if (params.attention_chunk_divmod.divisor > 0) { n_idx_left = std::max(n_idx_left, flash::round_down(params.attention_chunk_divmod, n_idx_bm)); } }
+                n_block_min_before_local_mask = !Is_local ? n_block_min : std::max(n_block_min, cute::ceil_div(n_idx_left, kBlockN));
+            }
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {
@@ -1377,7 +1403,7 @@ struct CollectiveMainloopFwdSm90 {
         int const m_block = get<0>(block_coord);
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
-        auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
+        auto [n_block_min, n_block_max, n_offset_pv] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod);
