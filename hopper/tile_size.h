@@ -23,9 +23,8 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
                 if (use_one_mma_wg) {
                     return {64, 192, true, true};
                 } else {
-                    // Switch to tile size 192 x 192 for now
-                    bool const use_blockN_128 = is_causal || is_local || paged_kv_non_TMA;
-                    return {192, use_blockN_128 ? 128 : 192, use_blockN_128, true};
+                    // kBlockN=160 benefits SWA when window length <= 128, keep IntraWGOverlap=true
+                    return {192, is_causal ? 128 : is_local || paged_kv_non_TMA ? 160 : 192, is_causal || is_local, true};
                 }
             }
             // Good for long seqlen (>= 4k) but suffers from tile quantization at short seqlen
