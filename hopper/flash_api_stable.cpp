@@ -758,8 +758,8 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
         int64_t sm_margin,
-        std::optional<const at::Tensor> &sinks_, // (h)
-        std::optional<at::Tensor> sparse_mask_fine_   // [total_q, max_k_blocks, num_int32_per_block]
+        std::optional<Tensor> sinks_, // (h)
+        std::optional<Tensor> sparse_mask_fine_   // [total_q, max_k_blocks, num_int32_per_block]
         ) {
 
     auto dprops = get_device_prop();
@@ -1198,9 +1198,9 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         }
     }
 
-    if(sinks_.has_value()) {
+    if (sinks_.has_value()) {
         auto sinks = sinks_.value();
-        TORCH_CHECK(sinks.scalar_type() == at::ScalarType::BFloat16,
+        STD_TORCH_CHECK(sinks.scalar_type() == torch::headeronly::ScalarType::BFloat16,
             "sinks must have dtype bfloat16");
         CHECK_DEVICE(sinks);
         CHECK_SHAPE(sinks, num_heads);
@@ -1232,18 +1232,19 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     // Handle sparse mask for Masked MHA (topk-based sparse attention)
     if (sparse_mask_fine_.has_value()) {
         auto sparse_mask_fine = sparse_mask_fine_.value();
-        TORCH_CHECK(sparse_mask_fine.dtype() == torch::kInt32, "sparse_mask_fine must have dtype int32");
+        STD_TORCH_CHECK(sparse_mask_fine.scalar_type() == torch::headeronly::ScalarType::Int,
+            "sparse_mask_fine must have dtype int32");
         CHECK_CONTIGUOUS(sparse_mask_fine);
 
         // sparse_mask_fine: [total_q, max_k_blocks, num_int64_per_block]
         // Row stride (max_k_blocks * num_int64_per_block) must be multiple of 16 for TMA 128-byte alignment
-        TORCH_CHECK(sparse_mask_fine.dim() == 3, "sparse_mask_fine must be 3D");
-        TORCH_CHECK(sparse_mask_fine.size(0) == total_q, "sparse_mask_fine dim 0 must match total_q");
-        TORCH_CHECK((sparse_mask_fine.size(1) * sparse_mask_fine.size(2) * sizeof(int)) % 128 == 0,
+        STD_TORCH_CHECK(sparse_mask_fine.dim() == 3, "sparse_mask_fine must be 3D");
+        STD_TORCH_CHECK(sparse_mask_fine.size(0) == total_q, "sparse_mask_fine dim 0 must match total_q");
+        STD_TORCH_CHECK((sparse_mask_fine.size(1) * sparse_mask_fine.size(2) * sizeof(int)) % 128 == 0,
             "sparse_mask_fine row stride (max_k_blocks * num_int32_per_block * sizeof(int)) must be multiple of 128 for TMA alignment");
 
         params.use_sparse_mask = true;
-        params.sparse_mask_fine = sparse_mask_fine.data_ptr<int>();
+        params.sparse_mask_fine = static_cast<int*>(sparse_mask_fine.data_ptr());
         params.sparse_mask_max_k_blocks = sparse_mask_fine.size(1);
         params.sparse_mask_fine_k_stride = sparse_mask_fine.stride(1);
         params.sparse_mask_fine_q_stride = sparse_mask_fine.stride(0);
@@ -1255,10 +1256,10 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         params.sparse_mask_q_tile_size = std::get<0>(kBlockMN);   // kBlockM
 
         // Sparse mask constraints
-        TORCH_CHECK(params.arch >= 90, "Sparse mask is only supported on SM90+ (Hopper)");
-        TORCH_CHECK(is_varlen, "Sparse mask requires varlen mode (cu_seqlens_q must be provided)");
+        STD_TORCH_CHECK(params.arch >= 90, "Sparse mask is only supported on SM90+ (Hopper)");
+        STD_TORCH_CHECK(is_varlen, "Sparse mask requires varlen mode (cu_seqlens_q must be provided)");
         #ifdef FLASHATTENTION_DISABLE_SPARSE_MASK
-        TORCH_CHECK(false, "This flash attention build does not support sparse mask.");
+        STD_TORCH_CHECK(false, "This flash attention build does not support sparse mask.");
         #endif
     }
 
@@ -1823,8 +1824,10 @@ void boxed_mha_fwd(
     auto num_splits = to<int64_t>(stack[31]);
     auto pack_gqa = to<std::optional<bool>>(stack[32]);
     auto sm_margin = to<int64_t>(stack[33]);
+    auto sinks = to<std::optional<Tensor>>(stack[34]);
+    auto sparse_mask_fine = to<std::optional<Tensor>>(stack[35]);
 
-    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin);
+    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin, sinks, sparse_mask_fine);
 
 
     stack[0] = from(out_);
