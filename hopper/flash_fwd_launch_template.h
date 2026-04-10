@@ -91,101 +91,56 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         cute::conditional_return<!V_colmajor>(
             make_stride(params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0),
             make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
-    typename CollectiveMainloop::Arguments mainloop_args = [&]() {
-        if constexpr (Arch >= 90) {
-            return typename CollectiveMainloop::Arguments {
-                static_cast<Element const*>(params.q_ptr),
-                {seqlen_q, params.d, params.h, batch_q},  // shape_Q
-                {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},  // stride_Q
-                static_cast<Element*>(params.k_ptr),
-                {!params.page_table ? (!is_varlen_k ? params.seqlen_k : params.total_k) : params.page_size,
-                    params.d, params.h_k, !params.page_table ? batch_k : params.num_pages},  // shape_K
-                {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},  // stride_K
-                static_cast<Element*>(params.v_ptr),
-                params.dv,  // headdim_v
-                v_strides,  // stride_V
-                static_cast<Element const*>(params.knew_ptr),
-                {!is_varlen_k_new ? params.seqlen_knew : params.total_knew, params.d, params.h_k, !is_varlen_k_new ? params.b : 1},  // shape_K_new
-                {params.knew_row_stride, _1{}, params.knew_head_stride, !is_varlen_k_new ? params.knew_batch_stride : 0},  // stride_K_new
-                static_cast<Element const*>(params.vnew_ptr),
-                {params.vnew_row_stride, _1{}, params.vnew_head_stride, !is_varlen_k_new ? params.vnew_batch_stride : 0}, // stride_V_new
-                static_cast<Element const*>(params.qv_ptr),
-                {params.qv_row_stride, _1{}, params.qv_head_stride, !is_varlen_q ? params.qv_batch_stride : 0},  // stride_Qv
-                static_cast<Element const*>(params.rotary_cos_ptr),
-                {params.seqlen_k, params.rotary_dim / 2},  // shape_rotary, the seqlen shape doesn't matter
-                {params.rotary_dim / 2, _1{}},  // stride_rotary_cos
-                static_cast<Element const*>(params.rotary_sin_ptr),
-                {params.rotary_dim / 2, _1{}},  // stride_rotary_sin
-                params.is_rotary_interleaved,
-                params.page_table,
-                // if page_size is not set, avoid dividing by zero
-                {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : params.seqlen_k / params.page_size}, // shape_page_table
-                {params.page_table_batch_stride, _1{}},  // stride_page_table
-                params.scale_softmax,
-                params.q_descale_ptr, params.k_descale_ptr, params.v_descale_ptr,
-                {params.q_descale_batch_stride, params.q_descale_head_stride},
-                {params.k_descale_batch_stride, params.k_descale_head_stride},
-                {params.v_descale_batch_stride, params.v_descale_head_stride},
-                params.window_size_left, params.window_size_right, params.attention_chunk,
-                params.softcap,
-                params.num_splits,
-                params.kv_batch_idx,
-                params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
-                params.seqused_q, params.seqused_k,
-                params.leftpad_k, params.seqlens_rotary,
-                static_cast<ElementSink const*>(params.sink_ptr),
-                // Sparse Mask for Masked MHA (topk-based sparse attention)
-                params.sparse_mask_fine,
-                params.sparse_mask_max_k_blocks,
-                params.sparse_mask_fine_q_stride,
-                params.sparse_mask_fine_k_stride,
-                params.total_q
-            };
-        } else {
-            return typename CollectiveMainloop::Arguments {
-                static_cast<Element const*>(params.q_ptr),
-                {seqlen_q, params.d, params.h, batch_q},  // shape_Q
-                {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},  // stride_Q
-                static_cast<Element*>(params.k_ptr),
-                {!params.page_table ? (!is_varlen_k ? params.seqlen_k : params.total_k) : params.page_size,
-                    params.d, params.h_k, !params.page_table ? batch_k : params.num_pages},  // shape_K
-                {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},  // stride_K
-                static_cast<Element*>(params.v_ptr),
-                params.dv,  // headdim_v
-                v_strides,  // stride_V
-                static_cast<Element const*>(params.knew_ptr),
-                {!is_varlen_k_new ? params.seqlen_knew : params.total_knew, params.d, params.h_k, !is_varlen_k_new ? params.b : 1},  // shape_K_new
-                {params.knew_row_stride, _1{}, params.knew_head_stride, !is_varlen_k_new ? params.knew_batch_stride : 0},  // stride_K_new
-                static_cast<Element const*>(params.vnew_ptr),
-                {params.vnew_row_stride, _1{}, params.vnew_head_stride, !is_varlen_k_new ? params.vnew_batch_stride : 0}, // stride_V_new
-                static_cast<Element const*>(params.qv_ptr),
-                {params.qv_row_stride, _1{}, params.qv_head_stride, !is_varlen_q ? params.qv_batch_stride : 0},  // stride_Qv
-                static_cast<Element const*>(params.rotary_cos_ptr),
-                {params.seqlen_k, params.rotary_dim / 2},  // shape_rotary, the seqlen shape doesn't matter
-                {params.rotary_dim / 2, _1{}},  // stride_rotary_cos
-                static_cast<Element const*>(params.rotary_sin_ptr),
-                {params.rotary_dim / 2, _1{}},  // stride_rotary_sin
-                params.is_rotary_interleaved,
-                params.page_table,
-                // if page_size is not set, avoid dividing by zero
-                {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : params.seqlen_k / params.page_size}, // shape_page_table
-                {params.page_table_batch_stride, _1{}},  // stride_page_table
-                params.scale_softmax,
-                params.q_descale_ptr, params.k_descale_ptr, params.v_descale_ptr,
-                {params.q_descale_batch_stride, params.q_descale_head_stride},
-                {params.k_descale_batch_stride, params.k_descale_head_stride},
-                {params.v_descale_batch_stride, params.v_descale_head_stride},
-                params.window_size_left, params.window_size_right, params.attention_chunk,
-                params.softcap,
-                params.num_splits,
-                params.kv_batch_idx,
-                params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
-                params.seqused_q, params.seqused_k,
-                params.leftpad_k, params.seqlens_rotary,
-                static_cast<ElementSink const*>(params.sink_ptr),
-            };
-        }
-    }();
+    typename CollectiveMainloop::Arguments mainloop_args = {
+        static_cast<Element const*>(params.q_ptr),
+        {seqlen_q, params.d, params.h, batch_q},  // shape_Q
+        {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},  // stride_Q
+        static_cast<Element*>(params.k_ptr),
+        {!params.page_table ? (!is_varlen_k ? params.seqlen_k : params.total_k) : params.page_size,
+            params.d, params.h_k, !params.page_table ? batch_k : params.num_pages},  // shape_K
+        {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},  // stride_K
+        static_cast<Element*>(params.v_ptr),
+        params.dv,  // headdim_v
+        v_strides,  // stride_V
+        static_cast<Element const*>(params.knew_ptr),
+        {!is_varlen_k_new ? params.seqlen_knew : params.total_knew, params.d, params.h_k, !is_varlen_k_new ? params.b : 1},  // shape_K_new
+        {params.knew_row_stride, _1{}, params.knew_head_stride, !is_varlen_k_new ? params.knew_batch_stride : 0},  // stride_K_new
+        static_cast<Element const*>(params.vnew_ptr),
+        {params.vnew_row_stride, _1{}, params.vnew_head_stride, !is_varlen_k_new ? params.vnew_batch_stride : 0}, // stride_V_new
+        static_cast<Element const*>(params.qv_ptr),
+        {params.qv_row_stride, _1{}, params.qv_head_stride, !is_varlen_q ? params.qv_batch_stride : 0},  // stride_Qv
+        static_cast<Element const*>(params.rotary_cos_ptr),
+        {params.seqlen_k, params.rotary_dim / 2},  // shape_rotary, the seqlen shape doesn't matter
+        {params.rotary_dim / 2, _1{}},  // stride_rotary_cos
+        static_cast<Element const*>(params.rotary_sin_ptr),
+        {params.rotary_dim / 2, _1{}},  // stride_rotary_sin
+        params.is_rotary_interleaved,
+        params.page_table,
+        // if page_size is not set, avoid dividing by zero
+        {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : params.seqlen_k / params.page_size}, // shape_page_table
+        {params.page_table_batch_stride, _1{}},  // stride_page_table
+        params.scale_softmax,
+        params.q_descale_ptr, params.k_descale_ptr, params.v_descale_ptr,
+        {params.q_descale_batch_stride, params.q_descale_head_stride},
+        {params.k_descale_batch_stride, params.k_descale_head_stride},
+        {params.v_descale_batch_stride, params.v_descale_head_stride},
+        params.window_size_left, params.window_size_right, params.attention_chunk,
+        params.softcap,
+        params.num_splits,
+        params.kv_batch_idx,
+        params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
+        params.seqused_q, params.seqused_k,
+        params.leftpad_k, params.seqlens_rotary,
+        static_cast<ElementSink const*>(params.sink_ptr)
+    };
+    // Sparse Mask for Masked MHA (topk-based sparse attention), SM90 only
+    if constexpr (Arch >= 90) {
+        mainloop_args.sparse_mask_fine = params.sparse_mask_fine;
+        mainloop_args.sparse_mask_max_k_blocks = params.sparse_mask_max_k_blocks;
+        mainloop_args.sparse_mask_fine_q_stride = params.sparse_mask_fine_q_stride;
+        mainloop_args.sparse_mask_fine_k_stride = params.sparse_mask_fine_k_stride;
+        mainloop_args.total_q = params.total_q;
+    }
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(params.o_ptr),
         {seqlen_q, params.dv, params.h, batch_q, params.num_splits},  // shape_O
