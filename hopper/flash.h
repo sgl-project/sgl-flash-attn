@@ -168,6 +168,17 @@ struct Flash_fwd_params : public Qkv_params {
     
     // Learnable sink
     void *__restrict__ sink_ptr;
+    int * __restrict__ sparse_mask_fine;
+
+    // sparse mask
+    int sparse_mask_k_block_size;
+    int sparse_mask_q_tile_size;
+    int sparse_mask_max_k_blocks;
+
+    int sparse_mask_fine_k_stride;
+    int sparse_mask_fine_q_stride;
+
+    bool use_sparse_mask;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

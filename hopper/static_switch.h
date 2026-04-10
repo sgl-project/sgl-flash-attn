@@ -202,3 +202,15 @@
       return __VA_ARGS__();                                                                      \
     }                                                                                            \
   }()
+
+// Sparse mask switch for Masked MHA (topk-based sparse attention)
+// Only supported on SM90+ with the TMA GMMA mainloop
+#ifdef FLASHATTENTION_DISABLE_SPARSE_MASK
+  #define SPARSE_MASK_SWITCH(COND, CONST_NAME, ...)                                              \
+  [&] {                                                                                          \
+    constexpr static bool CONST_NAME = false;                                                    \
+    return __VA_ARGS__();                                                                        \
+  }()
+#else
+  #define SPARSE_MASK_SWITCH BOOL_SWITCH
+#endif
