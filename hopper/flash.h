@@ -165,7 +165,9 @@ struct Flash_fwd_params : public Qkv_params {
 
     int arch;
     int num_sm;
-    
+
+    bool batch_invariant = false;
+
     // Learnable sink
     void *__restrict__ sink_ptr;
     int * __restrict__ sparse_mask_fine;
