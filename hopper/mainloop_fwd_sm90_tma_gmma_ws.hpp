@@ -29,7 +29,7 @@ namespace flash {
 using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
-        bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
+        bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_, bool OnlyQv_,
         bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSink_, bool Has_sparse_mask_=false, int kBlockH_=1>
 struct CollectiveMainloopFwdSm90 {
 
@@ -50,6 +50,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool PagedKVNonTMA = PagedKVNonTMA_;
     static constexpr bool AppendKV = AppendKV_;
     static constexpr bool HasQv = HasQv_;
+    static constexpr bool OnlyQv = OnlyQv_;
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool PackGQA_TMA = PackGQA && kBlockH_ > 1;
     static constexpr bool Split = Split_;
@@ -62,6 +63,7 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
     static constexpr bool LargeHeadDimV = kHeadDimV > 256;
+    static_assert(!OnlyQv || HasQv, "OnlyQv requires HasQv");
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
 
@@ -1325,13 +1327,15 @@ struct CollectiveMainloopFwdSm90 {
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read);
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
-            warpgroup_wait<0>();
+            if constexpr (!OnlyQv) {
+                flash::gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                warpgroup_wait<0>();
+            }
             pipeline_k.consumer_release(smem_pipe_read);
             if constexpr (HasQv) {
                 shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
                 consumer_wait(pipeline_v, smem_pipe_read);
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                flash::gemm</*zero_init=*/OnlyQv, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
             }
             scoremod_premask_fn(tSrS);
             // Apply mask: use sparse_mask when Has_sparse_mask, otherwise use regular causal/local mask
@@ -1372,7 +1376,9 @@ struct CollectiveMainloopFwdSm90 {
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
                 if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
-                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                if constexpr (!OnlyQv) {
+                    flash::gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                }
                 if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr(!HasQv) {
                     if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
@@ -1385,7 +1391,7 @@ struct CollectiveMainloopFwdSm90 {
                     warpgroup_wait<0>();
                     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
                     consumer_wait(pipeline_v, smem_pipe_read);
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                    flash::gemm</*zero_init=*/OnlyQv, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
                 }
                 scoremod_premask_fn(tSrS);
                 if constexpr (Has_sparse_mask) {
@@ -1490,7 +1496,9 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!Is_first_iter) { ++smem_pipe_read; }
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
-                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                if constexpr (!OnlyQv) {
+                    flash::gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                }
                 if constexpr (!HasQv) {
                     warp_scheduler_barrier_arrive();
                     warpgroup_wait<0>();
@@ -1500,7 +1508,7 @@ struct CollectiveMainloopFwdSm90 {
                         shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
                     }
                     consumer_wait(pipeline_v, smem_pipe_read);
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                    flash::gemm</*zero_init=*/OnlyQv, /*wg_wait=*/-1>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
                     warp_scheduler_barrier_arrive();
                     warpgroup_wait<1>();
                     pipeline_k.consumer_release(smem_pipe_read);  // release K
