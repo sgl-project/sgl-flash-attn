@@ -759,7 +759,8 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         std::optional<bool> pack_gqa_,
         int64_t sm_margin,
         std::optional<Tensor> sinks_, // (h)
-        std::optional<Tensor> sparse_mask_fine_   // [total_q, max_k_blocks, num_int32_per_block]
+        std::optional<Tensor> sparse_mask_fine_,  // [total_q, max_k_blocks, num_int32_per_block]
+        bool only_qv
         ) {
 
     auto dprops = get_device_prop();
@@ -1036,6 +1037,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
     // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    params.only_qv = only_qv;
 
     // This needs to be set after get_num_splits
     Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
@@ -1101,6 +1103,8 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
             params.qv_batch_stride = q_v.stride(0);
         }
     }
+
+    STD_TORCH_CHECK(!only_qv || q_v_.has_value(), "only_qv requires q_v");
 
     if (rotary_cos_.has_value()) {
         STD_TORCH_CHECK(k_new_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
@@ -1826,8 +1830,9 @@ void boxed_mha_fwd(
     auto sm_margin = to<int64_t>(stack[33]);
     auto sinks = to<std::optional<Tensor>>(stack[34]);
     auto sparse_mask_fine = to<std::optional<Tensor>>(stack[35]);
+    auto only_qv = to<bool>(stack[36]);
 
-    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin, sinks, sparse_mask_fine);
+    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin, sinks, sparse_mask_fine, only_qv);
 
 
     stack[0] = from(out_);

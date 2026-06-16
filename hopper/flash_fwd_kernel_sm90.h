@@ -43,6 +43,7 @@ public:
     static constexpr bool Transpose_V = CollectiveMainloop::Transpose_V;
     static constexpr bool AppendKV = CollectiveMainloop::AppendKV;
     static constexpr bool HasQv = CollectiveMainloop::HasQv;
+    static constexpr bool OnlyQv = CollectiveMainloop::OnlyQv;
     static constexpr bool Use_TMA_Q = CollectiveMainloop::Use_TMA_Q;
     static constexpr bool Use_TMA_KV = CollectiveMainloop::Use_TMA_KV;
     static constexpr bool Use_TMA_O = CollectiveEpilogue::Use_TMA_O;
