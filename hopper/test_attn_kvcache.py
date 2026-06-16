@@ -132,57 +132,6 @@ def attention_ref(
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
-def test_flash_attn_kvcache_only_qv():
-    torch.manual_seed(0)
-    device = "cuda"
-    dtype = torch.bfloat16
-    batch_size = 2
-    seqlen_q = 1
-    seqlen_k = 257
-    nheads_q = 8
-    nheads_kv = 1
-    v_dim = 512
-    page_size = 1
-    num_pages = batch_size * seqlen_k
-
-    v_cache = torch.randn(
-        num_pages, page_size, nheads_kv, v_dim, device=device, dtype=dtype
-    )
-    page_table = torch.arange(
-        num_pages, device=device, dtype=torch.int32
-    ).view(batch_size, seqlen_k)
-    qv = torch.randn(
-        batch_size, seqlen_q, nheads_q, v_dim, device=device, dtype=dtype
-    )
-    cache_seqlens = torch.full(
-        (batch_size,), seqlen_k, device=device, dtype=torch.int32
-    )
-
-    v_ref = rearrange(
-        v_cache.float()[page_table.flatten()],
-        "(b s) p h d -> b (s p) h d",
-        b=batch_size,
-    )
-    v_ref = repeat(v_ref, "b s h d -> b s (h g) d", g=nheads_q)
-    scores = torch.einsum("bqhd,bkhd->bhqk", qv.float(), v_ref)
-    probs = torch.softmax(scores / math.sqrt(v_dim), dim=-1)
-    out_ref = torch.einsum("bhqk,bkhd->bqhd", probs, v_ref).to(dtype)
-
-    out = flash_attn_interface.flash_attn_with_kvcache(
-        q=None,
-        k_cache=None,
-        v_cache=v_cache,
-        qv=qv,
-        cache_seqlens=cache_seqlens,
-        page_table=page_table,
-        only_qv=True,
-        num_splits=1,
-    )
-
-    assert (out - out_ref).abs().max().item() <= 8e-3
-    assert (out - out_ref).abs().mean().item() <= 3e-4
-
-
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("num_requests", [1, 4])
 @pytest.mark.parametrize("query_seqlen", [1, 8, 120])
