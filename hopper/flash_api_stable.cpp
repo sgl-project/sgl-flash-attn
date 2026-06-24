@@ -510,11 +510,18 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     int const num_n_blocks = (seqlen_k_loaded + kBlockN - 1) / kBlockN;
     int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
     int const size_one_kv_head = params.seqlen_k * (params.d + params.dv) * (params.is_e4m3 ? 1 : 2);
-    // Always enable PackGQA for Split
-    // If varlen, we use dynamic split, so this heuristic just needs to get an upper bound on num_splits.
-    // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
-    // that batch = 1.
-    int total_mblocks = (params.num_splits_dynamic_ptr ? 1 : params.b) * params.h_k * num_m_blocks;
+    // Use total_q so varlen with many short segments doesn't underestimate total_mblocks and over-split.
+    // Non-varlen path keeps the original B * H * num_m_blocks formula (byte-identical),
+    // since b * ceil(s / kBlockM) is the real per-batch padded tile count.
+    int total_mblocks;
+    if (varlen) {
+        int const packgqa_factor = params.h / params.h_k;
+        int const effective_total_q = params.total_q > 0 ? params.total_q : params.b * params.seqlen_q;
+        int const total_m_blocks_real = (effective_total_q * packgqa_factor + kBlockM - 1) / kBlockM;
+        total_mblocks = total_m_blocks_real * params.h_k;
+    } else {
+        total_mblocks = params.b * params.h_k * num_m_blocks;
+    }
     return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
     #endif
 }
