@@ -690,8 +690,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<bool> pack_gqa_,
         int64_t sm_margin,
         std::optional<const at::Tensor> &sinks_, // (h)
-        bool batch_invariant = false,
-        std::optional<at::Tensor> sparse_mask_fine_ = std::nullopt   // [total_q, max_k_blocks, num_int32_per_block]
+        bool batch_invariant,
+        std::optional<at::Tensor> sparse_mask_fine_,  // [total_q, max_k_blocks, num_int32_per_block]
+        bool only_qv
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -971,6 +972,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     params.batch_invariant = batch_invariant;
     // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    params.only_qv = only_qv;
 
     // This needs to be set after get_num_splits
     at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
@@ -1036,6 +1038,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             params.qv_batch_stride = q_v.stride(0);
         }
     }
+
+    TORCH_CHECK(!only_qv || q_v_.has_value(), "only_qv requires q_v");
 
     if (rotary_cos_.has_value()) {
         TORCH_CHECK(k_new_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");

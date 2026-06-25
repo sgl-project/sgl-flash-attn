@@ -79,6 +79,7 @@ def _flash_attn_forward(
     sm_margin: int = 0,
     sinks: Optional[torch.Tensor] = None,
     sparse_mask_fine: Optional[torch.Tensor] = None,
+    only_qv: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -128,7 +129,8 @@ def _flash_attn_forward(
         pack_gqa,
         sm_margin,
         sinks,
-        sparse_mask_fine
+        sparse_mask_fine,
+        only_qv
     )
 
     if out_accum is None:
@@ -178,6 +180,7 @@ def _flash_attn_forward_fake(
     sm_margin: int = 0,
     sinks: Optional[List[torch.Tensor]] = None,
     sparse_mask_fine: Optional[torch.Tensor] = None,
+    only_qv: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Symbolic fake implementation of flash attention forward.
@@ -979,7 +982,8 @@ def flash_attn_with_kvcache(
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
-    sparse_mask_fine: Optional[torch.Tensor] = None
+    sparse_mask_fine: Optional[torch.Tensor] = None,
+    only_qv=False,  # Skip QK matmul and use QvV only (NoPE).
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -1066,13 +1070,51 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+    if v_cache is None:
+        raise ValueError("v_cache must be provided")
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+
+    if k_cache is None:
+        if not only_qv:
+            raise ValueError("k_cache can only be None when only_qv=True")
+        if q is not None:
+            k_head_size = q.shape[-1]
+            k_dtype = q.dtype
+            k_device = q.device
+        elif k is not None:
+            k_head_size = k.shape[-1]
+            k_dtype = k.dtype
+            k_device = k.device
+        else:
+            k_head_size = 64
+            k_dtype = v_cache.dtype
+            k_device = v_cache.device
+        k_cache = torch.empty(
+            (*v_cache.shape[:-1], k_head_size), dtype=k_dtype, device=k_device
+        )
+    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+
+    if q is None:
+        if not only_qv:
+            raise ValueError("q can only be None when only_qv=True")
+        if qv is None:
+            raise ValueError("only_qv=True requires qv")
+        q = torch.empty(
+            (*qv.shape[:-1], k_cache.shape[-1]), dtype=qv.dtype, device=qv.device
+        )
+
     if softmax_scale is None:
-        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
+        if only_qv:
+            if qv is None:
+                raise ValueError("only_qv=True requires qv")
+            softmax_scale = qv.shape[-1] ** (-0.5)
+        else:
+            softmax_scale = (
+                q.shape[-1] + (qv.shape[-1] if qv is not None else 0)
+            ) ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
-            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=v_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
     # If sparse_mask is provided, set causal=False (mask handles causality)
@@ -1109,6 +1151,7 @@ def flash_attn_with_kvcache(
         scheduler_metadata=scheduler_metadata,
         num_splits=num_splits,
         pack_gqa=pack_gqa,
+        only_qv=only_qv,
         sm_margin=sm_margin,
         sinks=sinks,
         sparse_mask_fine=sparse_mask_fine
