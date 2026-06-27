@@ -9,8 +9,6 @@
 #include <cuda.h>
 #include <vector>
 
-#include <ATen/cuda/CUDAGeneratorImpl.h> // For at::Generator and at::PhiloxCudaState
-
 namespace FLASH_NAMESPACE {
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;
@@ -118,8 +116,12 @@ struct Flash_fwd_params : public Qkv_params {
     int window_size_left, window_size_right;
     float softcap;
 
-    // Random state.
-    at::PhiloxCudaState philox_args;
+    // Opaque storage for at::PhiloxCudaState (currently 24 bytes so we round up
+    // for cushion). Decouples this header (and the sparse inference path that 
+    // transitively includes it) from <ATen/cuda/CUDAGeneratorImpl.h>. Code for
+    // training in flash_api.cpp will write into it via placement-new and their
+    // respective kernels will read it via reinterpret_cast.
+    uint64_t philox_args[4];
 
     // Pointer to the RNG seed (idx 0) and offset (idx 1).
     uint64_t * rng_state;

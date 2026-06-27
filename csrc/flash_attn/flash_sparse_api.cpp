@@ -6,8 +6,6 @@
 #include <torch/nn/functional.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-#include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::Generator and at::PhiloxCudaState
-#include "philox_unpack.cuh"  // For at::cuda::philox::unpack
 
 #include <cutlass/numeric_types.h>
 
@@ -425,9 +423,8 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
         const double softmax_scale,
         bool is_causal,
         const double softcap,
-        const bool return_softmax,
-        const std::optional<at::Generator> gen_) {
-    
+        const bool return_softmax) {
+
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x = cc_major == 8 && cc_minor >= 0;
     bool is_sm90 = cc_major == 9 && cc_minor == 0;
@@ -461,6 +458,8 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    TORCH_CHECK(p_dropout == 0.0f, "Sparse attention does not support dropout for inference");
 
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
 
@@ -547,26 +546,8 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
         params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
         head_size_rounded, p_dropout, /*num_splits*/ 1, get_num_sm(get_current_device()), opts);
 
-    // NOTE(woosuk): Commented out because they are not used in inference.
-    // // number of times random will be generated per thread, to offset philox counter in thc random
-    // // state
-    // // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-    // int64_t counter_offset = params.b * params.h * 32;
-    // auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    // auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
-    // // Forward kernel will populate memory with the seed and offset.
-    // params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
-
-    // if (p_dropout > 0.0)  {
-    //     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-    //         gen_, at::cuda::detail::getDefaultCUDAGenerator());
-    //     // See Note [Acquire lock when using random generators]
-    //     std::lock_guard<std::mutex> lock(gen->mutex_);
-    //     params.philox_args = gen->philox_cuda_state(counter_offset);
-    // }
-
-    set_params_alibi(params, 
-        const_cast<std::optional<at::Tensor> &>(alibi_slopes_), 
+    set_params_alibi(params,
+        const_cast<std::optional<at::Tensor> &>(alibi_slopes_),
         batch_size, num_heads);
 
     if (seqlen_k > 0) {
@@ -607,8 +588,7 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
         const bool zero_tensors,
         bool is_causal,
         const double softcap,
-        const bool return_softmax,
-        c10::optional<at::Generator> gen_) {
+        const bool return_softmax) {
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x = cc_major == 8 && cc_minor >= 0;
@@ -646,6 +626,8 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
     int num_heads = sizes[1];
     const int head_size_og = sizes[2];
     const int num_heads_k = k.size(1);
+
+    TORCH_CHECK(p_dropout == 0.0f, "Sparse attention does not support dropout for inference");
 
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
 
@@ -754,26 +736,8 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
 
-    // NOTE(woosuk): Commented out because they are not used in inference.
-    // number of times random will be generated per thread, to offset philox counter in thc random
-    // state
-    // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-    // int64_t counter_offset = params.b * params.h * 32;
-    // auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    // auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
-    // // Forward kernel will populate memory with the seed and offset.
-    // params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
-
-    // if (p_dropout > 0.0)  {
-    //     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-    //         gen_, at::cuda::detail::getDefaultCUDAGenerator());
-    //     // See Note [Acquire lock when using random generators]
-    //     std::lock_guard<std::mutex> lock(gen->mutex_);
-    //     params.philox_args = gen->philox_cuda_state(counter_offset);
-    // }
-
-    set_params_alibi(params, 
-        const_cast<std::optional<at::Tensor> &>(alibi_slopes_), 
+    set_params_alibi(params,
+        const_cast<std::optional<at::Tensor> &>(alibi_slopes_),
         batch_size, num_heads);
 
     if (max_seqlen_k > 0) {

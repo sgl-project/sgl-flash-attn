@@ -10,7 +10,7 @@ namespace FLASH_NAMESPACE {
 
 using namespace cute;
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, typename Params>
 inline __device__ void sparse_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -27,17 +27,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNWarps = Kernel_traits::kNWarps;
-
-    auto seed_offset = at::cuda::philox::unpack(params.philox_args);
-    flash::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
-                           bidb, bidh, tidx, params.h);
-
-    // Save seed and offset for backward, before any early exiting. Otherwise the 0-th thread block might
-    // exit early and no one saves the rng states.
-    if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
-        params.rng_state[0] = std::get<0>(seed_offset);
-        params.rng_state[1] = std::get<1>(seed_offset);
-    }
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
@@ -58,9 +47,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     // We iterate over the blocks in reverse order. This is because the last block is the only one
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
     // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
-
-    const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
-        + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
 
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
                                           + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
@@ -93,10 +79,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     Tensor gVToken = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.v_ptr) + row_offset_v_token),
         Shape<Int<kBlockN>, Int<kHeadDim>>{},
         make_stride(_0{}, _1{}));
-        
-    Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
-                            Shape<Int<kBlockM>, Int<kBlockN>>{},
-                            make_stride(params.seqlen_k_rounded, _1{}));
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
@@ -131,8 +113,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
     Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
     Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
-
-    Tensor tSgS  = thr_mma.partition_C(gP);
 
     Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
 
@@ -346,20 +326,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
 
             // Convert acc_s from fp32 to fp16/bf16
             Tensor rP = flash::convert_type<Element>(acc_s);
-            int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
-            int block_col_idx = n_block * (kBlockN / 32);
-            if (Return_softmax) {
-                Tensor rP_drop = make_fragment_like(rP);
-                cute::copy(rP, rP_drop);
-                dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                    rP_drop, block_row_idx, block_col_idx, kNWarps
-                );
-                cute::copy(rP_drop, tSgS);
-                tSgS.data() = tSgS.data() + (-kBlockN);
-            }
-            if (Is_dropout) {
-                dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
-            }
 
             // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
             // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
@@ -405,20 +371,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
 
             // Convert acc_s from fp32 to fp16/bf16
             Tensor rP = flash::convert_type<Element>(acc_s);
-            int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
-            int block_col_idx = n_block * (kBlockN / 32);
-            if (Return_softmax) {
-                Tensor rP_drop = make_fragment_like(rP);
-                cute::copy(rP, rP_drop);
-                dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                    rP_drop, block_row_idx, block_col_idx, kNWarps
-                );
-                cute::copy(rP_drop, tSgS);
-                tSgS.data() = tSgS.data() + (-kBlockN);
-            }
-            if (Is_dropout) {
-                dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
-            }
 
             // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
             // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
@@ -428,7 +380,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
             // if (cute::thread0()) { print(scores); }
         }
     }
-     
+
     if (num_cols > 0) {
         auto* cols_ptr = params.column_index + ((bidb * params.h + bidh) * params.NUM_ROWS + m_block) * params.NNZ_V;
         // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
@@ -574,20 +526,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
 
             // Convert acc_s from fp32 to fp16/bf16
             Tensor rP = flash::convert_type<Element>(acc_s);
-            int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
-            int block_col_idx = n_block * (kBlockN / 32);
-            if (Return_softmax) {
-                Tensor rP_drop = make_fragment_like(rP);
-                cute::copy(rP, rP_drop);
-                dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                    rP_drop, block_row_idx, block_col_idx, kNWarps
-                );
-                cute::copy(rP_drop, tSgS);
-                tSgS.data() = tSgS.data() + (-kBlockN);
-            }
-            if (Is_dropout) {
-                dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
-            }
 
             // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
             // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
@@ -600,7 +538,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
 
     // Epilogue
 
-    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
+    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false>(acc_o, params.scale_softmax, params.rp_dropout);
 
     // Convert acc_o from fp32 to fp16/bf16
     Tensor rO = flash::convert_type<Element>(acc_o);
@@ -663,7 +601,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     );
 }
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, typename Params>
 inline __device__ void compute_sparse_attn(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -679,7 +617,7 @@ inline __device__ void compute_sparse_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    flash::sparse_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+    flash::sparse_attn_1rowblock<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap>(params, bidb, bidh, m_block);
 }
 
 } // namespace FLASH_NAMESPACE

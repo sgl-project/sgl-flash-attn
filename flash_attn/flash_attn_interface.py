@@ -106,7 +106,6 @@ def _sparse_attn_forward(
         causal,
         softcap,
         return_softmax,
-        None,
     )
     return out, softmax_lse
 
@@ -154,7 +153,6 @@ def _sparse_attn_varlen_forward(
         causal,
         softcap,
         return_softmax,
-        None,
     )
     return out, softmax_lse
 
