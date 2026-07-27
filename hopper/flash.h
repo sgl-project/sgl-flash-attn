@@ -217,7 +217,14 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
-void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
+void prepare_varlen_num_blocks(
+    Flash_fwd_params &params,
+    cudaStream_t stream,
+    bool packgqa,
+    int blockM,
+    int blockN,
+    bool enable_pdl,
+    bool validate_cu_seqlens);
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
 template <typename T, typename Tpartial, int kBlockK>

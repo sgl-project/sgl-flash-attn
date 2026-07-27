@@ -655,7 +655,14 @@ mha_fwd_get_scheduler_metadata(
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
         auto stream = at::cuda::getCurrentCUDAStream().stream();
-        prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
+        prepare_varlen_num_blocks(
+            params,
+            stream,
+            params.pack_gqa,
+            kBlockM,
+            kBlockN,
+            false /*enable_pdl*/,
+            false /*validate_cu_seqlens*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
     return tile_count_semaphore;

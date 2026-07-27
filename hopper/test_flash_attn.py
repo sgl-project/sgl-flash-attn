@@ -1,6 +1,9 @@
 import os
 import math
 import itertools
+import subprocess
+import sys
+import textwrap
 
 import pytest
 import torch
@@ -1261,3 +1264,59 @@ def test_flash3_bw_compatibility() -> None:
         "int attention_chunk=0, bool has_softcap=False, int num_splits=0, bool? pack_gqa=None, "
         "int sm_margin=0) -> Tensor"
     ))
+
+
+@pytest.mark.parametrize(
+    ("invalid_cu_seqlens", "expected_message"),
+    [
+        ("q", "cu_seqlens_q must end at the total number of query tokens"),
+        ("k", "cu_seqlens_k must end at the total number of key tokens"),
+    ],
+)
+def test_flash_attn_varlen_rejects_mismatched_cu_seqlens(
+    invalid_cu_seqlens, expected_message
+):
+    # A device-side assertion poisons its CUDA context. Run each failure in a
+    # child process so the rest of the test suite can continue using the GPU.
+    child = textwrap.dedent(
+        f"""
+        import torch
+        from flash_attn_interface import flash_attn_varlen_func
+
+        total_tokens = 8
+        q = torch.randn(
+            total_tokens, 1, 64, device="cuda", dtype=torch.bfloat16
+        )
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        valid = torch.tensor(
+            [0, total_tokens], device="cuda", dtype=torch.int32
+        )
+        invalid = torch.tensor(
+            [0, total_tokens - 1], device="cuda", dtype=torch.int32
+        )
+        cu_seqlens_q = invalid if {invalid_cu_seqlens!r} == "q" else valid
+        cu_seqlens_k = invalid if {invalid_cu_seqlens!r} == "k" else valid
+
+        flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            total_tokens,
+            total_tokens,
+        )
+        torch.cuda.synchronize()
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", child],
+        cwd=os.path.dirname(__file__),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode != 0
+    assert expected_message in result.stderr
