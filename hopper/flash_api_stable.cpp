@@ -724,7 +724,14 @@ mha_fwd_get_scheduler_metadata(
         void* stream_ptr = nullptr;
         TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_idx, &stream_ptr));
         cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
-        prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
+        prepare_varlen_num_blocks(
+            params,
+            stream,
+            params.pack_gqa,
+            kBlockM,
+            kBlockN,
+            false /*enable_pdl*/,
+            false /*validate_cu_seqlens*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
     return tile_count_semaphore;

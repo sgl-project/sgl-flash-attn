@@ -1,6 +1,9 @@
 import os
 import math
 import itertools
+import subprocess
+import sys
+import textwrap
 
 import pytest
 import torch
@@ -1261,3 +1264,121 @@ def test_flash3_bw_compatibility() -> None:
         "int attention_chunk=0, bool has_softcap=False, int num_splits=0, bool? pack_gqa=None, "
         "int sm_margin=0) -> Tensor"
     ))
+
+
+def _run_cuda_assert_subprocess(child, expected_message):
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(child)],
+        cwd=os.path.dirname(__file__),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode != 0
+    assert expected_message in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("invalid_cu_seqlens", ["q", "k"])
+@pytest.mark.parametrize(
+    ("invalid_offsets", "failure"),
+    [
+        ([1, 2, 5, 8], "start"),
+        ([0, 2, 5, 7], "end"),
+        ([0, 5, 4, 8], "decreasing"),
+        ([0, 2, 8, 8], "max_seqlen"),
+    ],
+)
+def test_flash_attn_varlen_rejects_mismatched_cu_seqlens(
+    invalid_cu_seqlens, invalid_offsets, failure
+):
+    # A device-side assertion poisons its CUDA context. Run each failure in a
+    # child process so the rest of the test suite can continue using the GPU.
+    prefix = f"cu_seqlens_{invalid_cu_seqlens}"
+    expected_message = {
+        "start": f"{prefix} must start at 0",
+        "end": (
+            f"{prefix} must end at the total number of "
+            f"{'query' if invalid_cu_seqlens == 'q' else 'key'} tokens"
+        ),
+        "decreasing": f"{prefix} must be non-decreasing",
+        "max_seqlen": (
+            f"{prefix} contains a sequence longer than "
+            f"max_seqlen_{invalid_cu_seqlens}"
+        ),
+    }[failure]
+    child = f"""
+        import torch
+        from flash_attn_interface import flash_attn_varlen_func
+
+        total_tokens = 8
+        max_seqlen = 5
+        q = torch.randn(
+            total_tokens, 1, 64, device="cuda", dtype=torch.bfloat16
+        )
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        valid = torch.tensor(
+            [0, 2, 5, total_tokens], device="cuda", dtype=torch.int32
+        )
+        invalid = torch.tensor(
+            {invalid_offsets!r}, device="cuda", dtype=torch.int32
+        )
+        cu_seqlens_q = invalid if {invalid_cu_seqlens!r} == "q" else valid
+        cu_seqlens_k = invalid if {invalid_cu_seqlens!r} == "k" else valid
+
+        flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen,
+            max_seqlen,
+        )
+        torch.cuda.synchronize()
+        """
+    _run_cuda_assert_subprocess(child, expected_message)
+
+
+def test_flash_attn_varlen_validates_cu_seqlens_on_cuda_graph_replay():
+    child = """
+        import torch
+        from flash_attn_interface import flash_attn_varlen_func
+
+        total_tokens = 8
+        max_seqlen = 5
+        q = torch.randn(
+            total_tokens, 1, 64, device="cuda", dtype=torch.bfloat16
+        )
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        cu_seqlens_q = torch.tensor(
+            [0, 2, 5, total_tokens], device="cuda", dtype=torch.int32
+        )
+        cu_seqlens_k = cu_seqlens_q.clone()
+
+        def run_attention():
+            return flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen,
+                max_seqlen,
+            )
+
+        run_attention()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_out = run_attention()
+
+        cu_seqlens_q[-1] = total_tokens - 1
+        graph.replay()
+        torch.cuda.synchronize()
+        """
+    _run_cuda_assert_subprocess(
+        child, "cu_seqlens_q must end at the total number of query tokens"
+    )

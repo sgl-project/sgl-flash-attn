@@ -3,6 +3,7 @@
  ******************************************************************************/
 
 #include <cub/cub.cuh>
+#include <c10/macros/Macros.h>
 #include "cutlass/fast_math.h"
 #include "cutlass/barrier.h"
 #include "cutlass/arch/barrier.h"
@@ -55,7 +56,11 @@ __global__ void prepare_varlen_num_blocks_kernel(
         bool enable_pdl,
         bool is_causal,
         bool packgqa,
-        int max_kvblocks_in_l2) {
+        int max_kvblocks_in_l2,
+        int total_q,
+        int total_k,
+        int total_k_new,
+        bool validate_cu_seqlens) {
 
     static constexpr int kNumBatchPerWarp = cutlass::NumThreadsPerWarp - 1;
     static constexpr int kSmemSize = 1;
@@ -69,7 +74,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
     // Allocate shared memory for BlockMergeSort operations
     __shared__ typename BlockMergeSort::TempStorage temp_storage;
 
-    if (enable_pdl) { cutlass::arch::launch_dependent_grids(); }
+    if (enable_pdl && !validate_cu_seqlens) { cutlass::arch::launch_dependent_grids(); }
 
     if (threadIdx.x < kSmemSize) { total_blocks_smem[threadIdx.x] = 0; }
     __syncthreads();
@@ -78,14 +83,45 @@ __global__ void prepare_varlen_num_blocks_kernel(
 
     int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
 
+    if (validate_cu_seqlens && blockIdx.x == 0 && threadIdx.x == 0) {
+        if (cu_seqlens_q) {
+            CUDA_KERNEL_ASSERT_MSG(cu_seqlens_q[0] == 0, "cu_seqlens_q must start at 0");
+            CUDA_KERNEL_ASSERT_MSG(
+                cu_seqlens_q[num_batch] == total_q,
+                "cu_seqlens_q must end at the total number of query tokens");
+        }
+        if (cu_seqlens_k) {
+            CUDA_KERNEL_ASSERT_MSG(cu_seqlens_k[0] == 0, "cu_seqlens_k must start at 0");
+            CUDA_KERNEL_ASSERT_MSG(
+                cu_seqlens_k[num_batch] == total_k,
+                "cu_seqlens_k must end at the total number of key tokens");
+        }
+        if (cu_seqlens_k_new) {
+            CUDA_KERNEL_ASSERT_MSG(cu_seqlens_k_new[0] == 0, "cu_seqlens_k_new must start at 0");
+            CUDA_KERNEL_ASSERT_MSG(
+                cu_seqlens_k_new[num_batch] == total_k_new,
+                "cu_seqlens_k_new must end at the total number of new key tokens");
+        }
+    }
+
     auto get_num_m_blocks = [&](int batch_idx) {
+        int cu_seqlen = 0;
+        if (cu_seqlens_q) {
+            int cur_cu_seqlen = batch_idx <= num_batch ? cu_seqlens_q[batch_idx] : 0;
+            int next_cu_seqlen = __shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);
+            cu_seqlen = next_cu_seqlen - cur_cu_seqlen;
+            if (validate_cu_seqlens && batch_idx < num_batch && lane < kNumBatchPerWarp) {
+                CUDA_KERNEL_ASSERT_MSG(cu_seqlen >= 0, "cu_seqlens_q must be non-decreasing");
+                CUDA_KERNEL_ASSERT_MSG(
+                    cu_seqlen <= seqlen_q_static,
+                    "cu_seqlens_q contains a sequence longer than max_seqlen_q");
+            }
+        }
         int seqlen;
         if (seqused_q) {
             seqlen = batch_idx < num_batch ? seqused_q[batch_idx] : 0;
         } else if (cu_seqlens_q) {
-            int cur_cu_seqlen = batch_idx <= num_batch ? cu_seqlens_q[batch_idx] : 0;
-            int next_cu_seqlen = __shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);
-            seqlen = next_cu_seqlen - cur_cu_seqlen;
+            seqlen = cu_seqlen;
         } else {
             seqlen = seqlen_q_static;
         }
@@ -96,13 +132,23 @@ __global__ void prepare_varlen_num_blocks_kernel(
 
     auto get_num_n_blocks = [&](int batch_idx) {
         int leftpad_k = batch_idx < num_batch && leftpad_k_ptr != nullptr ? leftpad_k_ptr[batch_idx] : 0;
+        int cu_seqlen = 0;
+        if (cu_seqlens_k) {
+            int cur_cu_seqlen = batch_idx <= num_batch ? cu_seqlens_k[batch_idx] : 0;
+            int next_cu_seqlen = __shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);
+            cu_seqlen = next_cu_seqlen - cur_cu_seqlen;
+            if (validate_cu_seqlens && batch_idx < num_batch && lane < kNumBatchPerWarp) {
+                CUDA_KERNEL_ASSERT_MSG(cu_seqlen >= 0, "cu_seqlens_k must be non-decreasing");
+                CUDA_KERNEL_ASSERT_MSG(
+                    cu_seqlen <= seqlen_k_static,
+                    "cu_seqlens_k contains a sequence longer than max_seqlen_k");
+            }
+        }
         int seqlen;
         if (seqused_k) {
             seqlen = batch_idx < num_batch ? seqused_k[batch_idx] : 0;
         } else if (cu_seqlens_k) {
-            int cur_cu_seqlen = batch_idx <= num_batch ? cu_seqlens_k[batch_idx] : 0;
-            int next_cu_seqlen = __shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);
-            seqlen = next_cu_seqlen - cur_cu_seqlen;
+            seqlen = cu_seqlen;
         } else {
             seqlen = seqlen_k_static;
         }
@@ -111,6 +157,12 @@ __global__ void prepare_varlen_num_blocks_kernel(
             int cur_cu_seqlen_new = batch_idx <= num_batch ? cu_seqlens_k_new[batch_idx] : 0;
             int next_cu_seqlen_new = __shfl_down_sync(0xffffffff, cur_cu_seqlen_new, 1);
             seqlen_new = next_cu_seqlen_new - cur_cu_seqlen_new;
+            if (validate_cu_seqlens && batch_idx < num_batch && lane < kNumBatchPerWarp) {
+                CUDA_KERNEL_ASSERT_MSG(seqlen_new >= 0, "cu_seqlens_k_new must be non-decreasing");
+                CUDA_KERNEL_ASSERT_MSG(
+                    seqlen_new <= seqlen_k_new_static,
+                    "cu_seqlens_k_new contains a sequence longer than max_seqlen_k_new");
+            }
         } else {
             seqlen_new = seqlen_k_new_static;
         }
@@ -126,6 +178,10 @@ __global__ void prepare_varlen_num_blocks_kernel(
     int batch_idx = lane + bidb_start;
     int num_m_blocks = get_num_m_blocks(batch_idx);
     int num_n_blocks = get_num_n_blocks(batch_idx);
+
+    // Delay the dependent attention grid until all cu_seqlens validation has
+    // executed. PDL is only enabled when this preparation uses a single CTA.
+    if (enable_pdl && validate_cu_seqlens) { cutlass::arch::launch_dependent_grids(); }
 
     auto get_nheads_in_l2 = [&](int n_blocks) {
         int nheads_in_l2 = n_blocks * 16 <= max_kvblocks_in_l2 ? 16
@@ -217,7 +273,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
 } // flash
 
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa,
-                               int blockM, int blockN, bool enable_pdl) {
+                               int blockM, int blockN, bool enable_pdl, bool validate_cu_seqlens) {
     int qhead_per_khead = cutlass::ceil_div(params.h, params.h_k);
     int num_warps = cutlass::ceil_div(params.b, 31); // warp switch will cap this at 32
     int num_ctas = cutlass::ceil_div(params.b, 31 * 32);
@@ -244,7 +300,11 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
                 enable_pdl,
                 params.is_causal,
                 packgqa,
-                max_kvblocks_in_l2);
+                max_kvblocks_in_l2,
+                params.total_q,
+                params.total_k,
+                params.total_knew,
+                validate_cu_seqlens);
         });
     });
 }
