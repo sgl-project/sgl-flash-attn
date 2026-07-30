@@ -289,7 +289,14 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
             }
             #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM256
-            if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+            if (params.d <= 256) {
+                return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+            }
+            #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM512
+            if (params.d <= 512) {
+                return run_mha_fwd_<Arch, cutlass::bfloat16_t, 512, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+            }
             #endif
         } else {
             #ifndef FLASHATTENTION_DISABLE_FP16
@@ -328,6 +335,11 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
             #ifndef FLASHATTENTION_DISABLE_HDIM256
             if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::half_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
             #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM512
+            if (params.d <= 512) {
+                return run_mha_fwd_<Arch, cutlass::half_t, 512, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+            }
+            #endif
             #else
             TORCH_CHECK(false, "This flash attention build does not support FP16.");
             #endif
@@ -357,6 +369,9 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
         #endif
         #ifndef FLASHATTENTION_DISABLE_HDIM256
         if (params.d <= 256) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+        #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM512
+        if (params.d <= 512) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 512, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
         #endif
         #else
         TORCH_CHECK(false, "This flash attention build does not support FP8.");
@@ -471,6 +486,9 @@ inline int get_num_splits(Flash_fwd_params const& params) {
 }
 
 inline int get_max_headdim() {
+    #ifndef FLASHATTENTION_DISABLE_HDIM512
+    return 512;
+    #endif
     #ifndef FLASHATTENTION_DISABLE_HDIM256
     return 256;
     #endif

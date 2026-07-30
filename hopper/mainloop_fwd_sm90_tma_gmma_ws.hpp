@@ -1384,9 +1384,11 @@ struct CollectiveMainloopFwdSm90 {
         Layout warp_group_thread_layout = make_layout(make_shape(Int<MmaWarpGroups>{}),
                                                       make_stride(Int<cutlass::NumThreadsPerWarpGroup>{}));
 
-        int warp_group_idx = __shfl_sync(0xFFFFFFFF, thread_idx / cutlass::NumThreadsPerWarpGroup, 0);
+        // With LargeHeadDimV the PV mma runs on WG2+, so map the global thread index
+        // back to a local warpgroup index for partitioning.
+        int mma_wg_idx = (thread_idx % NumMmaThreads) / cutlass::NumThreadsPerWarpGroup;
         TiledMmaPV tiled_mma_pv;
-        auto wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx));
+        auto wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(mma_wg_idx));
 
         // Allocate "fragments/descriptors"
         Tensor tOrV = wg_mma_pv.partition_fragment_B(sV);

@@ -11,6 +11,8 @@ DTYPE_MAP = {
 
 SM = [80]  # Sm80 kernels support up to
 HEAD_DIMENSIONS = [32, 64, 96, 128, 192, 256]
+# headdim 512 only has a split-KV (decode) kernel; prefill/bwd smem doesn't fit.
+SPLIT_ONLY_HEAD_DIMENSIONS = [512]
 IS_CAUSAL = ["false", "true"]
 NAMESPACE_INCLUDE = '#include "namespace_config.h"\n'
 
@@ -77,6 +79,8 @@ def get_all_kernels() -> List[Kernel]:
     for direction in ["fwd", "fwd_split", "bwd"]:
         for dtype, head_dim, is_causal, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, IS_CAUSAL, SM):
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, is_causal=is_causal, direction=direction)
+    for dtype, head_dim, is_causal, sm in itertools.product(DTYPE_MAP.keys(), SPLIT_ONLY_HEAD_DIMENSIONS, IS_CAUSAL, SM):
+        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, is_causal=is_causal, direction="fwd_split")
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
     prelude = """// Copyright (c) 2024, Tri Dao.

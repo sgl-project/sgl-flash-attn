@@ -244,9 +244,10 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-                if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+                if (params.num_splits <= 1 && !force_split_kernel && kHeadDim < 512) {  // If we don't set it num_splits == 0
                     run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
                 } else {
+                    // headdim 512 only has a split-KV (decode) kernel; non-split smem doesn't fit.
                     run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
                 }
             });
@@ -302,7 +303,7 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     const int num_splits, const int num_sm, struct c10::TensorOptions opts) {
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
-    const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+    const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : (head_size <= 256 ? 64 : 32));
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
@@ -390,7 +391,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     const int seqlen_k = k.size(1);
     const int num_heads_k = k.size(2);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
+    TORCH_CHECK(head_size <= 512, "FlashAttention forward only supports head dimension at most 512");
     TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
@@ -602,7 +603,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int total_q = q.sizes()[0];
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
+    TORCH_CHECK(head_size <= 512, "FlashAttention forward only supports head dimension at most 512");
     TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
@@ -761,7 +762,12 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-                run_mha_bwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+                // headdim 512 has no backward kernel (fwd split-KV / decode only).
+                if constexpr (kHeadDim <= 256) {
+                    run_mha_bwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+                } else {
+                    TORCH_CHECK(false, "FlashAttention backward does not support head dimension > 256");
+                }
             });
         });
     });
@@ -1269,7 +1275,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     const int num_heads_k = kcache.size(2);
     const int batch_size_c = !paged_KV ? kcache.size(0) : batch_size;
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
+    TORCH_CHECK(head_size_og <= 512, "FlashAttention forward only supports head dimension at most 512");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     // causal=true is the same as causal=false in this case
