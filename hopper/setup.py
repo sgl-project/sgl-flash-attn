@@ -64,6 +64,7 @@ DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
+DISABLE_HDIM512 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM512", "FALSE") == "TRUE"
 DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
@@ -118,6 +119,7 @@ def create_build_config_file():
             "FLASHATTENTION_DISABLE_HDIM128": DISABLE_HDIM128,
             "FLASHATTENTION_DISABLE_HDIM192": DISABLE_HDIM192,
             "FLASHATTENTION_DISABLE_HDIM256": DISABLE_HDIM256,
+            "FLASHATTENTION_DISABLE_HDIM512": DISABLE_HDIM512,
             "FLASHATTENTION_DISABLE_SM8x": DISABLE_SM8x,
             "FLASHATTENTION_ENABLE_VCOLMAJOR": ENABLE_VCOLMAJOR,
             "FLASH_ATTENTION_DISABLE_HDIMDIFF64": DISABLE_HDIMDIFF64,
@@ -445,7 +447,9 @@ ext_modules = []
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if not USE_TRITON_ROCM:
-    subprocess.run(["git", "submodule", "update", "--init", "../csrc/cutlass"])
+    cutlass_path = Path(this_dir) / ".." / "csrc" / "cutlass"
+    if not cutlass_path.exists():
+        subprocess.run(["git", "submodule", "update", "--init", "../csrc/cutlass"])
 
 if not SKIP_CUDA_BUILD:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -498,10 +502,11 @@ if not SKIP_CUDA_BUILD:
         nvcc_path_new = os.path.join(ctk_path_new, f"nvcc{exe_extension}")
         # Need to append to path otherwise nvcc can't find cicc in nvvm/bin/cicc
         # nvcc 12.8 seems to hard-code looking for cicc in ../nvvm/bin/cicc
-        os.environ["PATH"] = ctk_path_new + os.pathsep + os.environ["PATH"]
-        os.environ["PYTORCH_NVCC"] = nvcc_path_new
-        # Make nvcc executable, sometimes after the copy it loses its permissions
-        os.chmod(nvcc_path_new, os.stat(nvcc_path_new).st_mode | stat.S_IEXEC)
+        if os.path.exists(nvcc_path_new):
+            os.environ["PATH"] = ctk_path_new + os.pathsep + os.environ["PATH"]
+            os.environ["PYTORCH_NVCC"] = nvcc_path_new
+            # Make nvcc executable, sometimes after the copy it loses its permissions
+            os.chmod(nvcc_path_new, os.stat(nvcc_path_new).st_mode | stat.S_IEXEC)
 
     cc_flag = []
     cc_flag.append("-gencode")
@@ -533,6 +538,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_HDIM128"] if DISABLE_HDIM128 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM192"] if DISABLE_HDIM192 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIM512"] if DISABLE_HDIM512 else [])
         + (["-DFLASHATTENTION_DISABLE_SM8x"] if DISABLE_SM8x else [])
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF64"] if DISABLE_HDIMDIFF64 else [])
@@ -553,7 +559,7 @@ if not SKIP_CUDA_BUILD:
     )
     # build will now explode with this compilation grouping given all our templating
     # HEAD_DIMENSIONS_FWD = ["all", "diff"]
-    HEAD_DIMENSIONS_FWD = HEAD_DIMENSIONS_BWD
+    HEAD_DIMENSIONS_FWD = HEAD_DIMENSIONS_BWD + ([512] if not DISABLE_HDIM512 else [])
     HEAD_DIMENSIONS_DIFF64_FWD = (
         []
         + (["64_256"] if not DISABLE_HDIMDIFF64 else [])
@@ -575,7 +581,8 @@ if not SKIP_CUDA_BUILD:
     # We already always hard-code PackGQA=true for Sm9x if PagedKV or Split
     sources_fwd_sm90 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                         for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
-                        if not (packgqa and (paged or split))]
+                        if not (packgqa and (paged or split))
+                        and not (hdim == 512 and dtype == "e4m3")]  # hdim512 + e4m3 not supported
     if not DISABLE_HDIMDIFF64:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                              for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF64_FWD, HALF_DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)

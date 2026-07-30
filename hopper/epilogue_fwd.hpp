@@ -21,7 +21,7 @@ namespace flash {
 using namespace cute;
 
 template <class TileShape_MNK_PV_, class ClusterShape_, class Element_, class ArchTag_,
-          int NumEpilogueThreads_, bool Varlen_, bool PackGQA_, bool Split_, bool FP8PermuteCol=false>
+          int NumEpilogueThreads_, bool Varlen_, bool PackGQA_, bool Split_, bool FP8PermuteCol=false, int kHeadDim=0>
 struct CollectiveEpilogueFwd {
 
     using TileShape_MNK_PV = TileShape_MNK_PV_;

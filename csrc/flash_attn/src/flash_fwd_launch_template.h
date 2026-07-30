@@ -98,7 +98,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     });
 }
 
-template<typename Kernel_traits, bool Is_causal>
+template<typename Kernel_traits, typename Combine_traits, bool Is_causal>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!Kernel_traits::Is_Q_in_regs, "SplitKV implementation does not support Is_Q_in_regs");
     static_assert(!Kernel_traits::Share_Q_K_smem, "SplitKV implementation does not support Share_Q_K_smem");
@@ -134,27 +134,26 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         });
     });
     if (params.num_splits > 1) {
-        // We want kBlockM to be as small as possible for more parallelism.
-        // With 128 threads we can load 512 elements at a time, so if headdim is divisible by 128, kBlockM = 4.
-        // If headdim is divisible by 64, then we set kBlockM = 8, etc.
-        constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
+        constexpr static int kBlockM = Combine_traits::kHeadDim % 128 == 0 ? 4 : (Combine_traits::kHeadDim % 64 == 0 ? 8 : 16);
         dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+            auto combine_kernel = &flash_fwd_splitkv_combine_kernel<Combine_traits, kBlockM, 1, IsEvenKConst>;
             if (params.num_splits <= 2) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                combine_kernel = &flash_fwd_splitkv_combine_kernel<Combine_traits, kBlockM, 1, IsEvenKConst>;
             } else if (params.num_splits <= 4) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                combine_kernel = &flash_fwd_splitkv_combine_kernel<Combine_traits, kBlockM, 2, IsEvenKConst>;
             } else if (params.num_splits <= 8) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                combine_kernel = &flash_fwd_splitkv_combine_kernel<Combine_traits, kBlockM, 3, IsEvenKConst>;
             } else if (params.num_splits <= 16) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                combine_kernel = &flash_fwd_splitkv_combine_kernel<Combine_traits, kBlockM, 4, IsEvenKConst>;
             } else if (params.num_splits <= 32) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                combine_kernel = &flash_fwd_splitkv_combine_kernel<Combine_traits, kBlockM, 5, IsEvenKConst>;
             } else if (params.num_splits <= 64) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                combine_kernel = &flash_fwd_splitkv_combine_kernel<Combine_traits, kBlockM, 6, IsEvenKConst>;
             } else if (params.num_splits <= 128) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                combine_kernel = &flash_fwd_splitkv_combine_kernel<Combine_traits, kBlockM, 7, IsEvenKConst>;
             }
+            combine_kernel<<<grid_combine, Combine_traits::kNThreads, 0, stream>>>(params);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
     }
@@ -162,18 +161,27 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
 template<typename T, int Headdim, bool Is_causal>
 void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
-    constexpr static int kBlockM = 64;
+    constexpr static int kBlockM = Headdim > 256 ? 16 : 64;
+    constexpr static int kNWarps = kBlockM / 16;
     // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
     // and for headdim 192 with block size 64 x 128.
-    constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
-    // if user specifies num_splits=1, we assume they want bitwise identical
-    // numerics across the split KV and standard kernels so we align kBLockN to
-    // match
-    if (params.num_splits == 1) {
-        constexpr static int kBlockN_standard = Headdim <= 64 ? 128 : 64;
-        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN_standard, 4, false, false, T>, Is_causal>(params, stream);
+    // headdim 512 uses kBlockN=32 to keep dynamic smem within the per-block limit.
+    constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : (Headdim <= 256 ? 64 : 32));
+    // The combine kernel always uses kBlockM=64 / 4 warps, independent of the attention tile.
+    using Combine_traits = Flash_fwd_kernel_traits<Headdim, 64, kBlockN, 4, false, false, T>;
+    if constexpr (Headdim <= 256) {
+        // if user specifies num_splits=1, we assume they want bitwise identical
+        // numerics across the split KV and standard kernels so we align kBLockN to
+        // match
+        if (params.num_splits == 1) {
+            constexpr static int kBlockN_standard = Headdim <= 64 ? 128 : 64;
+            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN_standard, kNWarps, false, false, T>, Combine_traits, Is_causal>(params, stream);
+        } else {
+            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, false, false, T>, Combine_traits, Is_causal>(params, stream);
+        }
     } else {
-        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
+        // headdim 512 has no standard (non-split) kernel to align kBlockN against.
+        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, false, false, T>, Combine_traits, Is_causal>(params, stream);
     }
 }
 

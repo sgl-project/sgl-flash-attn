@@ -234,6 +234,8 @@ public:
         if constexpr (Use_TMA_KV && !SameHeadDim) {
             pipeline_params_vt.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
             if constexpr (LargeHeadDimV) { pipeline_params_vt.num_consumers = NumMmaThreads; }
+        } else if constexpr (Use_TMA_KV) {
+            if constexpr (LargeHeadDimV) { pipeline_params_vt.num_consumers = NumMmaThreads; }
         } else {
             if constexpr (LargeHeadDimV) { pipeline_params_vt.consumer_arv_count = NumMmaThreads; }
         }

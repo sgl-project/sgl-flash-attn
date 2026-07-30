@@ -68,7 +68,7 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kHeadDim = kHeadDim_;
     static_assert(kHeadDim % 32 == 0);
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
-    static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
+    static constexpr int kBlockKGmem = kHeadDim == 512 ? 32 : (kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32));
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
     using TiledMma = TiledMMA<
@@ -136,13 +136,15 @@ struct Flash_fwd_kernel_traits : public Base {
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
 
+    // Derived from kNThreads so that configs with fewer than 4 warps still cover every row.
     using GmemLayoutAtomOaccum = std::conditional_t<
         kBlockKSmem == 32,
-        Layout<Shape <_16, _8>,  // Thread layout, 8 threads per row
+        Layout<Shape <Int<kNThreads / 8>, _8>,  // Thread layout, 8 threads per row
                Stride< _8, _1>>,
-        Layout<Shape <_8, _16>,  // Thread layout, 16 threads per row
+        Layout<Shape <Int<kNThreads / 16>, _16>,  // Thread layout, 16 threads per row
                Stride< _16, _1>>
     >;
+    static_assert(kNThreads % 16 == 0, "kNThreads must be a multiple of 16 for GmemLayoutAtomOaccum");
     using GmemTiledCopyOaccum = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
                         GmemLayoutAtomOaccum{},
