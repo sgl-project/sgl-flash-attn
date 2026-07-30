@@ -1,9 +1,11 @@
 # Head dim 512 decode benchmark (SM90)
 
+Workload: gemma4-style decode, `head_dim = 512`, `q_len = 1`, `q_head = 8`,
+`k_head = 1`, `batch = 1`, bf16, causal.
+
 ## Setup
 
 - GPU: H200 (sm90a), CUDA 13.0 (nvcc V13.0.88), torch 2.11.0+cu130
-- Shape: `b=1`, `sq=1` (decode), `hq=8 / hkv=1` (GQA), `hd_qk = hd_v = 512`, bf16, causal
 - FA3 numbers produced by:
 
 ```bash
