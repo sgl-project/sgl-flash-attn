@@ -56,11 +56,13 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         } else if (headdim <= 96) {
             return {192, 128, true, true};
         } else if (headdim <= 128) {
-            if (use_one_mma_wg) {
-                return {64, 96, true, true};
-            } else {
-                return {128, paged_kv_non_TMA ? 160 : (v_colmajor || (softcap && is_local) ? 192 : 224), true, true};
-            }
+            // Decode and prefill share the same kBlockN so the online-softmax
+            // reduction over K uses the same tile boundaries in both paths,
+            // removing the systematic FP8 KV-cache decode/prefill logprob
+            // mismatch (sgl-project/sglang#25790). Decode keeps a smaller
+            // kBlockM=64 for latency; only kBlockN needs to match prefill's.
+            int const kBlockN = paged_kv_non_TMA ? 160 : (v_colmajor || (softcap && is_local) ? 192 : 224);
+            return {use_one_mma_wg ? 64 : 128, kBlockN, true, true};
         } else if (headdim <= 192) {
             return {128, (paged_kv_non_TMA || softcap) && is_local ? 128 : 160, true, true};
         } else {
