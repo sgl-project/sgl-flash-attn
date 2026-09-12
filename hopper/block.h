@@ -6,7 +6,7 @@
 
 namespace flash {
 
-template <class SeqlenInfo_t, int kBlockM, int kBlockN, bool Is_causal, bool Is_local, bool PackGQA=false, bool Split=false>
+template <class SeqlenInfo_t, int kBlockM, int kBlockN, bool Is_causal, bool Is_local, bool PackGQA=false, bool Split=false, bool UseLocalKVOffset=true>
 struct BlockMN {
 
     static
@@ -21,6 +21,7 @@ struct BlockMN {
         int seqlen_k = seqlen_info.seqlen_k;
         int const seqlen_q = seqlen_info.seqlen_q;
         int n_offset = 0;
+        int n_block_min = 0;
 
         // If local, calculate n_offset and update seqlen_k
         if constexpr (Is_local) {
@@ -31,10 +32,13 @@ struct BlockMN {
             if (attention_chunk_divmod.divisor > 0) {
                 n_idx_left = std::max(n_idx_left, flash::round_down(attention_chunk_divmod, n_idx));
             }
-            // unlike previously, we don't divide by kBlockN because we want offset for seqlen_k
-            n_offset = std::max(int(0), n_idx_left);
-            // Subtract n_offset from seqlen_k for subsequent calculations such as n_block_max
-            seqlen_k -= n_offset;
+            if constexpr (UseLocalKVOffset) {
+                n_offset = std::max(int(0), n_idx_left);
+                seqlen_k -= n_offset;
+            } else {
+                // Keep absolute blocks when the mainloop does not shift KV pointers.
+                n_block_min = std::max(int(0), n_idx_left / kBlockN);
+            }
         }
 
         int n_block_max = cute::ceil_div(seqlen_k, kBlockN);
@@ -46,8 +50,7 @@ struct BlockMN {
             n_block_max = std::min(n_block_max,
                                    cute::ceil_div(m_idx_max + seqlen_k - seqlen_q + window_size_right, kBlockN));
         }
-        // Now, only adjust n_block_min if split
-        int n_block_min = 0;
+        // Partition the selected block range if split.
         // if (threadIdx.x == 128) { printf("Inside, bid.x = %d, bid.y = %d, bid.z = %d, split_idx = %d, n_block_min: %d, n_block_max: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, split_idx, n_block_min, n_block_max); }
         if constexpr (Split) {
             uint32_t num_splits_dynamic_u = reinterpret_cast<uint32_t const&>(split_idx) >> 16; // first 16 bits are for num_splits
