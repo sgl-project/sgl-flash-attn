@@ -108,3 +108,34 @@ def test_qk64_v256_is_rejected():
             q, k, v, cu_seqlens_q=None, cu_seqlens_k=None,
             max_seqlen_q=q.shape[1], max_seqlen_k=k.shape[1],
         )
+
+
+def test_cache_batch_indices_match_query_batch():
+    q, k, v = _qkv(b=4, sq=1, sk=256)
+    indices = torch.tensor([1, 0, 3, 2, 3], device=DEVICE, dtype=torch.int32)
+    for invalid in (indices[:2], indices):
+        with pytest.raises(RuntimeError, match="kv_batch_idx"):
+            flash_attn_with_kvcache(q, k, v, cache_batch_idx=invalid)
+    out = flash_attn_with_kvcache(q, k, v, cache_batch_idx=indices[:4])
+    _check(out, _attention_ref(q, k[indices[:4]], v[indices[:4]]))
+
+
+@pytest.mark.parametrize("page_size", [176, 256])
+@pytest.mark.parametrize("num_splits", [0, 1, 3])
+@pytest.mark.parametrize("page_table_view", [False, True])
+def test_empty_page_table_does_not_read_allocated_cache(
+    page_size, num_splits, page_table_view
+):
+    q, _, _ = _qkv(sq=256, sk=256, h=2, hk=2)
+    k = torch.randn(4, page_size, 2, 128, device=DEVICE, dtype=DTYPE)
+    v = torch.randn_like(k)
+    if page_table_view:
+        table = torch.zeros(2, 4, device=DEVICE, dtype=torch.int32)[:, :0]
+    else:
+        table = torch.empty(2, 0, device=DEVICE, dtype=torch.int32)
+    out, lse, *_ = flash_attn_with_kvcache(
+        q, k, v, page_table=table, num_splits=num_splits, return_softmax_lse=True
+    )
+    assert out.shape == q.shape
+    assert torch.count_nonzero(out).item() == 0
+    assert torch.isposinf(lse).all().item()

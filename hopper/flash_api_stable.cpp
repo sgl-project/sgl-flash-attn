@@ -2,8 +2,6 @@
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
 
-#include <Python.h>
-
 #include <cutlass/numeric_types.h>
 
 #include "flash.h"
@@ -18,9 +16,6 @@
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
 
-// Declare the CUDA stream function that's behind #ifdef USE_CUDA in shim.h
-extern "C" AOTITorchError aoti_torch_get_current_cuda_stream(int32_t device_index, void** ret_stream);
-
 #include <torch/headeronly/core/ScalarType.h>
 #include <torch/headeronly/util/Exception.h>
 
@@ -34,7 +29,7 @@ namespace tsa = torch::stable::accelerator;
 
 namespace {
 inline tsa::DeviceGuard make_device_guard(const Tensor& t) {
-  return tsa::DeviceGuard(static_cast<tsa::DeviceIndex>(t.get_device()));
+  return tsa::DeviceGuard(t.get_device_index());
 }
 std::deque<std::once_flag> device_flags;
 std::vector<cudaDeviceProp> device_properties;
@@ -311,9 +306,12 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
                 if constexpr (Arch == 90) {
                     if (params.dv > 256) {
                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                    } else if (params.dv > 64) {
+                    }
+                    #ifndef FLASHATTENTION_DISABLE_HDIMDIFF64_256
+                    else if (params.dv > 64) {
                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                     }
+                    #endif
                 }
                 #endif
                 return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
@@ -348,9 +346,12 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
                 if constexpr (Arch == 90) {
                     if (params.dv > 256) {
                         return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
-                    } else if (params.dv > 64) {
+                    }
+                    #ifndef FLASHATTENTION_DISABLE_HDIMDIFF64_256
+                    else if (params.dv > 64) {
                         return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                     }
+                    #endif
                 }
                 #endif
                 return run_mha_fwd_<Arch, cutlass::half_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
@@ -671,7 +672,6 @@ mha_fwd_get_scheduler_metadata(
     bool is_varlen = true;
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
     auto device_guard = make_device_guard(seqused_k);
 
     // This needs to be set after get_num_splits
@@ -711,7 +711,7 @@ mha_fwd_get_scheduler_metadata(
         auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
-        auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
+        auto device_idx = seqused_k.get_device_index();
         void* stream_ptr = nullptr;
         TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_idx, &stream_ptr));
         cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
@@ -847,6 +847,10 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
                    "If V headdim is different from Q/K dim, we only support Q/K headdim in (128, 192] and V headdim in (96, 128], "
                    "or (Q/K <= 64 and V <= 512).");
         STD_TORCH_CHECK(dprops->major == 9, "Only Hopper supports different V headdim");
+        #ifdef FLASHATTENTION_DISABLE_HDIMDIFF64_256
+        STD_TORCH_CHECK(!(head_size <= 64 && head_size_v > 64 && head_size_v <= 256),
+                    "This flash attention build does not support Q/K headdim <= 64 with V headdim in (64, 256].");
+        #endif
         if (head_size_v > 256) {
             STD_TORCH_CHECK(q_type == torch::headeronly::ScalarType::Half || q_type == torch::headeronly::ScalarType::BFloat16,
                         "HeaddimV > 256 requires fp16 and bf16 data type");
@@ -886,6 +890,15 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
         CHECK_SHAPE(page_table, batch_size_k, max_num_pages_per_seq);
     }
+
+    #ifdef FLASHATTENTION_VARLEN_ONLY_SPLIT_PAGED_SOFTCAP
+    // These variants are only built for varlen; full-length seqused_k preserves dense results.
+    if (!is_varlen_q && !is_varlen_k && !seqused_q_.has_value() && !seqused_k_.has_value()
+        && !leftpad_k_.has_value() && (paged_KV || softcap > 0.0 || num_splits != 1)) {
+        seqused_k_ = torch::stable::full({batch_size}, seqlen_k,
+            torch::headeronly::ScalarType::Int, q.layout(), q.device());
+    }
+    #endif
 
     if (seqused_q_.has_value()){
         auto seqused_q = seqused_q_.value();
@@ -942,7 +955,6 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     int const seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
     auto device_guard = make_device_guard(q);
 
     Tensor softmax_lse;
@@ -1150,6 +1162,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         auto kv_batch_idx = kv_batch_idx_.value();
         CHECK_DEVICE(kv_batch_idx); CHECK_CONTIGUOUS(kv_batch_idx);
         STD_TORCH_CHECK(kv_batch_idx.scalar_type() == torch::headeronly::ScalarType::Int, "kv_batch_idx must have dtype int32");
+        CHECK_SHAPE(kv_batch_idx, batch_size);
         params.kv_batch_idx = reinterpret_cast<int *>(kv_batch_idx.data_ptr());
     }
 
@@ -1240,6 +1253,11 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     STD_TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
     #endif
 
+    #ifdef FLASHATTENTION_VARLEN_ONLY_SPLIT_PAGED_SOFTCAP
+    STD_TORCH_CHECK(is_varlen || (params.num_splits == 1 && !(params.page_table && !params.pagedkv_tma) && params.softcap == 0.0),
+                "This flash attention build only supports split, paged and softcap attention in varlen mode.");
+    #endif
+
     // Handle sparse mask for Masked MHA (topk-based sparse attention)
     if (sparse_mask_fine_.has_value()) {
         auto sparse_mask_fine = sparse_mask_fine_.value();
@@ -1275,8 +1293,10 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     }
 
 
-    if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
-        auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
+    // An allocated paged cache can still have no logical keys if its page table is empty.
+    if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0
+        && (!paged_KV || seqlen_k > 0)) {
+        auto device_idx = q.get_device_index();
         void* stream_ptr = nullptr;
         TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_idx, &stream_ptr));
         cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
@@ -1583,7 +1603,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
     auto device_guard = make_device_guard(q);
 
     // auto opts = q.options();
@@ -1671,7 +1690,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
     #endif
 
     if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
-        auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
+        auto device_idx = q.get_device_index();
         void* stream_ptr = nullptr;
         TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_idx, &stream_ptr));
         cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
@@ -1749,7 +1768,6 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
     auto device_guard = make_device_guard(out_partial);
 
     auto softmax_lse = torch::stable::new_empty(out_partial, {batch_size, num_heads, seqlen}, std::make_optional(torch::headeronly::ScalarType::Float));
@@ -1780,7 +1798,7 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
     params.arch = dprops->major * 10 + dprops->minor;
 
     if (seqlen > 0 && batch_size > 0) {
-        auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
+        auto device_idx = out_partial.get_device_index();
         void* stream_ptr = nullptr;
         TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_idx, &stream_ptr));
         cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);

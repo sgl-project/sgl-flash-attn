@@ -12,15 +12,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include <ATen/core/dispatch/Dispatcher.h>
-#include <torch/all.h>
-#include <torch/library.h>
+#include <torch/csrc/stable/library.h>
 
 #include "sgl_fa3_ops.h"
 
 // Ops live in their own `sgl_fa3` namespace rather than `sgl_kernel`, so this
 // wheel and an sglang-kernel that still ships FA3 can be imported side by side.
-TORCH_LIBRARY(sgl_fa3, m) {
+STABLE_TORCH_LIBRARY(sgl_fa3, m) {
   /*
    * From flash-attention
    */
@@ -64,7 +62,6 @@ TORCH_LIBRARY(sgl_fa3, m) {
       "    bool     only_qv"
       ") -> (Tensor(a!), Tensor, Tensor, Tensor)");  // first return aliases out
 
-  m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 
   /*
    * From flash-attention: get_scheduler_metadata
@@ -98,7 +95,10 @@ TORCH_LIBRARY(sgl_fa3, m) {
       "    int      sm_margin = 0"
       ") -> Tensor");
 
-  m.impl("get_scheduler_metadata", torch::kCUDA, make_pytorch_shim(&mha_fwd_get_scheduler_metadata));
 }
 
-REGISTER_EXTENSION(_C)
+STABLE_TORCH_LIBRARY_IMPL(sgl_fa3, CUDA, m) {
+  // Reuse FA3's existing stable boxed adapters, including its four-result fwd API.
+  m.impl("fwd", &boxed_mha_fwd);
+  m.impl("get_scheduler_metadata", &boxed_mha_fwd_get_scheduler_metadata);
+}

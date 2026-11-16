@@ -1,7 +1,7 @@
 [build-system]
 requires = [
   "scikit-build-core>=0.10",
-  "torch==2.14.1",
+  "torch==2.11.0",
   "wheel",
 ]
 build-backend = "scikit_build_core.build"
@@ -18,9 +18,8 @@ classifiers = [
   "License :: OSI Approved :: BSD License",
   "Environment :: GPU :: NVIDIA CUDA",
 ]
-# The extension uses the regular (non-stable) torch C++ ABI, so it only loads
-# against the torch it was built with. Bump together with SGLang's torch pin.
-dependencies = ["torch==2.14.1"]
+# Build against the oldest supported stable Torch ABI; newer runtimes reuse the binary.
+dependencies = ["torch>=2.11"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sgl-flash-attn/tree/sgl-kernel/sgl_fa3"

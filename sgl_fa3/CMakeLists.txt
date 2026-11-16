@@ -37,7 +37,7 @@ if (CUDAToolkit_VERSION VERSION_LESS "12.4")
 endif()
 
 # Torch
-find_package(Torch REQUIRED)
+find_package(Torch 2.11 REQUIRED)
 
 # Torch's CMake config appends `-gencode` flags for the local GPU; drop them so
 # only the targets listed below are compiled.
@@ -68,7 +68,7 @@ FetchContent_Declare(
 FetchContent_Populate(repo-cutlass)
 
 set(SGL_FA3_HOPPER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../hopper")
-if (NOT EXISTS "${SGL_FA3_HOPPER_DIR}/flash_api.cpp")
+if (NOT EXISTS "${SGL_FA3_HOPPER_DIR}/flash_api_stable.cpp")
     message(FATAL_ERROR "FA3 sources not found at ${SGL_FA3_HOPPER_DIR}; build sgl_fa3 from a full checkout")
 endif()
 
@@ -133,7 +133,7 @@ list(FILTER FA3_FP16_GEN_SRCS EXCLUDE REGEX "flash_fwd_hdim64_256_")
 set(SGL_FA3_SOURCES
     "csrc/fa3_extension.cc"
     "${SGL_FA3_HOPPER_DIR}/flash_prepare_scheduler.cu"
-    "${SGL_FA3_HOPPER_DIR}/flash_api.cpp"
+    "${SGL_FA3_HOPPER_DIR}/flash_api_stable.cpp"
     "${SGL_FA3_HOPPER_DIR}/flash_fwd_combine.cu"
     ${FA3_BF16_GEN_SRCS}
     ${FA3_FP16_GEN_SRCS}
@@ -156,6 +156,8 @@ target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 # Variants SGLang never reaches are compiled out; calls that would need one fail with a
 # TORCH_CHECK in mha_fwd instead of silently running something else.
 set(SGL_FA3_COMPILE_DEFS
+    TORCH_TARGET_VERSION=0x020B000000000000ULL
+    USE_CUDA
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
     FLASHATTENTION_DISABLE_UNEVEN_K
