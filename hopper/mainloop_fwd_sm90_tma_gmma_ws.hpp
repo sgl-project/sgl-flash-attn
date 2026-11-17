@@ -123,6 +123,27 @@ struct CollectiveMainloopFwdSm90 {
         cute::GMMA::rs_op_selector<Element, Element, ElementAccum, TileShape_MNK_PV, GMMA::Major::K, MmaMajorV>(),
         AtomLayoutPV{}));
 
+    // FP8 two-level accumulation of O += P @ V (see flash::gemm) keeps the running O in FP32 and adds
+    // each KV block's WGMMA result to it. In the mainloop without intra-warpgroup overlap (e.g. paged KV
+    // with hdim 256), doing that inside flash::gemm needs a second O-sized fragment (128 floats/thread at
+    // hdim 256), which spills, and reads the accumulator before the WGMMA completes, which serializes
+    // WGMMA (ptxas C7514). Instead, split P @ V along the head dimension into kPvChunkN-wide chunks with
+    // two double-buffered partial accumulators: the tensor cores compute chunk c + 1 while the CUDA cores
+    // apply the softmax rescale and add chunk c into O (O = O * scale + partial).
+#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
+    static constexpr bool Fp8TwoLevelPV = Is_FP8;
+#else
+    static constexpr bool Fp8TwoLevelPV = false;
+#endif
+    static constexpr int kPvChunkN = 64;
+    static constexpr int NumPvChunks = kHeadDimV / kPvChunkN;
+    static constexpr bool PvChunkedTwoLevel = Fp8TwoLevelPV && MmaPV_is_RS && !IntraWGOverlap && !LargeHeadDimV
+        && !HasQv && kHeadDimV % kPvChunkN == 0 && NumPvChunks >= 2;
+    using TiledMmaPVChunk = decltype(cute::make_tiled_mma(
+        cute::GMMA::rs_op_selector<Element, Element, ElementAccum,
+                 Shape<Int<kBlockM>, Int<kPvChunkN>, Int<kBlockN>>, GMMA::Major::K, MmaMajorV>(),
+        AtomLayoutQK{}));
+
     static constexpr int NumMmaThreadsQK = size(TiledMmaQK{});
     static constexpr int NumMmaThreads = size(TiledMmaPV{});
     static constexpr int NumProducerThreads = !Transpose_V && Use_TMA_KV && Use_TMA_Q ? cutlass::NumThreadsPerWarp : cutlass::NumThreadsPerWarpGroup;
@@ -1208,6 +1229,54 @@ struct CollectiveMainloopFwdSm90 {
         Tensor tSrK = wg_mma_qk.partition_fragment_B(sK);
         Tensor tOrV = wg_mma_pv.partition_fragment_B(sV);
         Tensor tOsP = wg_mma_pv.partition_fragment_A(sP);
+        TiledMmaPVChunk tiled_mma_pv_chunk;
+        auto wg_mma_pv_chunk = tiled_mma_pv_chunk.get_slice(warp_group_thread_layout(warp_group_idx));
+        // (MMA, MMA_N, MMA_K, NumPvChunks, kStages), only used if PvChunkedTwoLevel
+        Tensor tOrV_chunk = [&] {
+            if constexpr (PvChunkedTwoLevel) {
+                Tensor sV_div = flat_divide(sV, Shape<Int<kPvChunkN>, Int<kBlockN>>{});  // (kPvChunkN, kBlockN, NumPvChunks, 1, kStages)
+                return wg_mma_pv_chunk.partition_fragment_B(make_tensor(sV_div.data(), select<0, 1, 2, 4>(sV_div.layout())));
+            } else {
+                return tOrV;  // Placeholder, not used
+            }
+        }();
+        // tOrO = tOrO * scores_scale (per row) + P @ V, accumulating each chunk in FP32 on the CUDA cores.
+        // All WGMMAs issued here have completed when this returns.
+        auto pv_gemm_two_level_chunked = [&](auto const& tOrP_, int const stage, auto const& scores_scale_) {
+            Tensor tOrO_part0 = partition_fragment_C(tiled_mma_pv_chunk, Shape<Int<kBlockM>, Int<kPvChunkN>>{});
+            Tensor tOrO_part1 = make_fragment_like(tOrO_part0);
+            Tensor tOrO_rowcol = make_tensor(tOrO.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
+            auto issue = [&](auto chunk, auto& part) {
+                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_pv_chunk, tOrP_, tOrV_chunk(_, _, _, chunk, stage), part);
+            };
+            auto merge = [&](auto chunk, auto& part) {
+                warpgroup_fence_operand(part);
+                Tensor part_rowcol = make_tensor(part.data(), flash::convert_layout_acc_rowcol(part.layout()));
+                static constexpr int kCols = CUTE_STATIC_V(size<1>(part_rowcol));
+                static_assert(kCols * NumPvChunks == CUTE_STATIC_V(size<1>(tOrO_rowcol)));
+                static constexpr int kColOffset = decltype(chunk)::value * kCols;
+                #pragma unroll
+                for (int mi = 0; mi < size<0>(part_rowcol); ++mi) {
+                    #pragma unroll
+                    for (int ni = 0; ni < kCols; ++ni) {
+                        tOrO_rowcol(mi, kColOffset + ni) = fmaf(tOrO_rowcol(mi, kColOffset + ni), scores_scale_(mi), part_rowcol(mi, ni));
+                    }
+                }
+            };
+            issue(Int<0>{}, tOrO_part0);
+            issue(Int<1>{}, tOrO_part1);
+            cute::for_each(make_int_sequence<NumPvChunks>{}, [&](auto chunk) {
+                static constexpr int C = decltype(chunk)::value;
+                if constexpr (C + 1 < NumPvChunks) { warpgroup_wait<1>(); } else { warpgroup_wait<0>(); }
+                if constexpr (C % 2 == 0) {
+                    merge(chunk, tOrO_part0);
+                    if constexpr (C + 2 < NumPvChunks) { issue(Int<C + 2>{}, tOrO_part0); }
+                } else {
+                    merge(chunk, tOrO_part1);
+                    if constexpr (C + 2 < NumPvChunks) { issue(Int<C + 2>{}, tOrO_part1); }
+                }
+            });
+        };
         Tensor tSrQv = wg_mma_qv.partition_fragment_A(sQv);
         Tensor tSrV = wg_mma_qv.partition_fragment_B(sVMmaQV);
         Tensor tPsP = smem_thr_copy_P.partition_D(cute::as_position_independent_swizzle_tensor(sP));
@@ -1531,11 +1600,14 @@ struct CollectiveMainloopFwdSm90 {
                 convert_type_out(tOrP_acc, tOrP);
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
-                if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
+                // With PvChunkedTwoLevel, the rescale is fused into the PV merge below
+                if constexpr (!Is_first_iter && !PvChunkedTwoLevel) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr (!MmaPV_is_RS && !MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
-                if constexpr (!MmaPV_use_RS_WG1) {
+                if constexpr (PvChunkedTwoLevel && !Is_first_iter) {
+                    pv_gemm_two_level_chunked(tOrP, smem_pipe_read.index(), scores_scale);
+                } else if constexpr (!MmaPV_use_RS_WG1) {
                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 } else {
                     TiledMmaPV_RS tiled_mma_pv_rs;
