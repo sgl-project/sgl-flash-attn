@@ -93,3 +93,10 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm8x(
         return {128, 64, 8, 2, false};
     }
 }
+
+// Attention-sink kernels are only compiled for the shapes used by sink models: gpt-oss (64), Granite-SWA (64, 128),
+// Flint (128), MiMo-V2 (192/128, ViT 64). Other shapes with sinks are rejected in flash_api.
+constexpr bool sink_supported(int hdim, int hdim_v, bool is_bf16, bool has_softcap) {
+    return is_bf16 && !has_softcap &&
+           ((hdim == 64 && hdim_v == 64) || (hdim == 128 && hdim_v == 128) || (hdim == 192 && hdim_v == 128));
+}

@@ -117,6 +117,7 @@ if ENABLE_OPCHECK:
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("has_sink", [False, True])
 @pytest.mark.parametrize("has_qv", [False, True])
 # @pytest.mark.parametrize("has_qv", [True])
 # @pytest.mark.parametrize("deterministic", [False, True])
@@ -165,7 +166,7 @@ if ENABLE_OPCHECK:
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_output(
-        seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv, mha_type, dtype
+        seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv, has_sink, mha_type, dtype
 ):
     if V_colmajor and (seqlen_k % 16 != 0 or dtype != torch.float8_e4m3fn):
         pytest.skip("V_colmajor requires seqlen_k to be a multiple of 16 and dtype to be float8_e4m3fn")
@@ -190,6 +191,9 @@ def test_flash_attn_output(
     attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if not DISABLE_LOCAL else [0]
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         print(f"{dv = }, {attention_chunk = }")
+        if has_sink and (dtype != torch.bfloat16 or softcap > 0.0 or (d, dv) not in [(64, 64), (128, 128), (192, 128)]):
+            continue  # sink kernels are only compiled for these shapes (sink_supported in tile_size.h)
+        sinks = torch.randn(nheads, device=device, dtype=torch.bfloat16) if has_sink else None
         q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
         if softcap > 0.0:
             # Ensure the values of qk are at least within softcap range.
@@ -223,7 +227,8 @@ def test_flash_attn_output(
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
             attention_chunk=attention_chunk,
-            softcap=softcap
+            softcap=softcap,
+            sinks=sinks,
         )
         out_pt, attn_pt = attention_ref(
             q_ref,
@@ -237,6 +242,7 @@ def test_flash_attn_output(
             window_size=window_size,
             attention_chunk=attention_chunk,
             softcap=softcap,
+            sinks=sinks,
             upcast=False,
             reorder_ops=True,
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
@@ -261,7 +267,7 @@ def test_flash_attn_output(
         num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             print(f"{pack_gqa = }, {num_splits = }")
-            out = flash_attn_func(
+            run = lambda sinks_: flash_attn_func(
                 q,
                 k,
                 v,
@@ -272,8 +278,17 @@ def test_flash_attn_output(
                 attention_chunk=attention_chunk,
                 softcap=softcap,
                 pack_gqa=pack_gqa,
-                num_splits=num_splits
+                num_splits=num_splits,
+                sinks=sinks_,
+                return_attn_probs=True,
             )
+            out, lse = run(sinks)
+            if has_sink:
+                # A sink only adds exp(s) to the softmax denominator: lse_sink == logaddexp(lse, s) exactly (fp32).
+                # This catches a sink applied more than once per row, e.g. once per KV split.
+                _, lse_nosink = run(None)
+                lse_expected = torch.logaddexp(lse_nosink, sinks.float().view(1, -1, 1))
+                assert (lse - lse_expected).abs().max().item() <= 2e-5
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
             # if not causal:
@@ -286,6 +301,7 @@ def test_flash_attn_output(
 
         if (
             not DISABLE_BACKWARD 
+            and not has_sink  # no backward for sinks
             and dtype != torch.float8_e4m3fn 
             and not V_colmajor 
             and not has_qv
@@ -354,6 +370,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("has_sink", [False, True])
 @pytest.mark.parametrize("has_qv", [False, True])
 # @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
@@ -402,7 +419,7 @@ def test_flash_attn_output(
     ],
 )
 def test_flash_attn_varlen_output(
-    seqlen_q, seqlen_k, d, add_unused_qkv, causal, local, softcap, deterministic, has_qv, mha_type, dtype,
+    seqlen_q, seqlen_k, d, add_unused_qkv, causal, local, softcap, deterministic, has_qv, has_sink, mha_type, dtype,
 ):
     if has_qv and (d != 64 or dtype == torch.float8_e4m3fn):
         pytest.skip("Has Qv requires hdim 64 and dtype to be float16 or bfloat16 (not float8_e4m3fn)")
@@ -428,6 +445,9 @@ def test_flash_attn_varlen_output(
     attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k and not DISABLE_LOCAL else [0]
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         print(f"{dv = }, {attention_chunk = }")
+        if has_sink and (dtype != torch.bfloat16 or softcap > 0.0 or (d, dv) not in [(64, 64), (128, 128), (192, 128)]):
+            continue  # sink kernels are only compiled for these shapes (sink_supported in tile_size.h)
+        sinks = torch.randn(nheads, device=device, dtype=torch.bfloat16) if has_sink else None
         q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
         if softcap > 0.0:
             # Ensure the values of qk are at least within softcap range.
@@ -505,7 +525,8 @@ def test_flash_attn_varlen_output(
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
             attention_chunk=attention_chunk,
-            softcap=softcap
+            softcap=softcap,
+            sinks=sinks,
         )
         out_pt, attn_pt = attention_ref(
             q_ref,
@@ -519,6 +540,7 @@ def test_flash_attn_varlen_output(
             window_size=window_size,
             attention_chunk=attention_chunk,
             softcap=softcap,
+            sinks=sinks,
             upcast=False,
             reorder_ops=True,
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
@@ -545,7 +567,7 @@ def test_flash_attn_varlen_output(
         # print("seqused_k: ", seqused_k)
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             print(f"{pack_gqa = }, {num_splits = }")
-            out_unpad = flash_attn_varlen_func(
+            run = lambda sinks_: flash_attn_varlen_func(
                 q_unpad,
                 k_unpad,
                 v_unpad,
@@ -564,10 +586,19 @@ def test_flash_attn_varlen_output(
                 softcap=softcap,
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
+                sinks=sinks_,
+                return_attn_probs=True,
             )
+            out_unpad, lse = run(sinks)
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
                 out.masked_fill_(q_zero_masking, 0.0)
+            if has_sink and query_unused_mask is None:  # unused query slots have no defined LSE
+                # A sink only adds exp(s) to the softmax denominator: lse_sink == logaddexp(lse, s) exactly (fp32).
+                # This catches a sink applied more than once per row, e.g. once per KV split.
+                _, lse_nosink = run(None)
+                lse_expected = torch.logaddexp(lse_nosink, sinks.float().view(-1, 1))
+                assert (lse - lse_expected).abs().max().item() <= 2e-5
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
             # if not causal:
@@ -581,6 +612,7 @@ def test_flash_attn_varlen_output(
 
         if (
             not DISABLE_BACKWARD 
+            and not has_sink  # no backward for sinks
             and dtype != torch.float8_e4m3fn 
             and not has_qv
             and not dv > 256

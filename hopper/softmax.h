@@ -89,15 +89,15 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int kNRows, int Max_offset=0>
+template <int kNRows, int Max_offset=0, bool Has_sink=false>
 struct Softmax {
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
     TensorT row_max, row_sum;
     float const softmax_scale_log2;
 
-    bool has_sink = false;
     TensorT row_sink;
+    bool apply_sink = false;
 
     CUTLASS_DEVICE Softmax(float const softmax_scale_log2_) : softmax_scale_log2(softmax_scale_log2_) {};
 
@@ -128,7 +128,7 @@ struct Softmax {
 
     template<bool Is_packGQA, typename Tensor0>
     __forceinline__ __device__ void set_row_sink(Tensor0 &sSink, int bidh, int qhead_per_khead = 0, int row_start = 0, int row_step = 0) {
-        has_sink = true;
+        apply_sink = true;
         if constexpr (!Is_packGQA) {
             #pragma unroll
             for(int mi = 0; mi < size(row_sink); ++mi) {
@@ -162,13 +162,14 @@ struct Softmax {
         TensorT scores_scale;
         #pragma unroll
         for (int mi = 0; mi < size(row_sum); ++mi) {
-            if (row_max(mi) == -INFINITY) { row_max(mi) = 0.f; }
-            
             float sum = row_sum(mi);
-            if (has_sink) {
-                const float max_scaled = row_max(mi) * softmax_scale_log2 - Max_offset;
-                float const extra = exp2f(float(M_LOG2E) * row_sink(mi) - max_scaled);
-                sum += extra;
+            if constexpr (Has_sink) {
+                if (apply_sink) {
+                    if (row_max(mi) == -INFINITY) { row_max(mi) = 0.f; }
+                    const float max_scaled = row_max(mi) * softmax_scale_log2 - Max_offset;
+                    float const extra = exp2f(float(M_LOG2E) * row_sink(mi) - max_scaled);
+                    sum += extra;
+                }
             }
             
             float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;

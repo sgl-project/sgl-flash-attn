@@ -30,7 +30,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_, bool OnlyQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSink_, bool Has_sparse_mask_=false, int kBlockH_=1>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSink_, bool Has_sparse_mask_=false, bool Has_sink_=false, int kBlockH_=1>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -42,6 +42,7 @@ struct CollectiveMainloopFwdSm90 {
     using ElementAccum = ElementAccum_;
     using ElementSink = ElementSink_;
     using ArchTag = ArchTag_;
+    static constexpr bool Has_sink = Has_sink_;
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;;
     static constexpr bool Is_causal = Is_causal_;
     static constexpr bool Is_local = Is_local_;

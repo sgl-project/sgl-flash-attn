@@ -243,6 +243,7 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
+    sinks=None,
 ):
     """
     Arguments:
@@ -322,7 +323,12 @@ def attention_ref(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
-    attention = torch.softmax(scores, dim=-1).to(v.dtype)
+    if sinks is not None:
+        # Learnable attention sink: one extra logit per head that takes probability mass but has no value.
+        sink_col = sinks.to(scores.dtype).view(1, -1, 1, 1).expand(scores.shape[0], -1, scores.shape[2], 1)
+        attention = torch.softmax(torch.cat([scores, sink_col], dim=-1), dim=-1)[..., :-1].to(v.dtype)
+    else:
+        attention = torch.softmax(scores, dim=-1).to(v.dtype)
     # We want to mask here so that the attention matrix doesn't have any NaNs
     # Otherwise we'll get NaN in dV
     if query_padding_mask is not None:

@@ -27,7 +27,7 @@ using namespace cute;
 
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv, bool OnlyQv,
-          bool PackGQA, bool Split, bool V_colmajor, bool Use_one_mma_wg, bool Has_sparse_mask=false>
+          bool PackGQA, bool Split, bool V_colmajor, bool Use_one_mma_wg, bool Has_sparse_mask=false, bool Has_sink=false>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
@@ -53,7 +53,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
     using CollectiveMainloop = std::conditional_t<
         Arch >= 90,
-        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, OnlyQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, ElementSink, Has_sparse_mask>,
+        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, OnlyQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, ElementSink, Has_sparse_mask, Has_sink>,
         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementSink>
     >;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV>;
@@ -242,7 +242,11 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                                     // Sparse mask is only supported on SM90+ and requires Varlen mode
                                     // When Has_sparse_mask is true, causal/local masks are bypassed (handled by sparse mask)
                                     SPARSE_MASK_SWITCH(params.use_sparse_mask && Arch >= 90 && Varlen, Has_sparse_mask, [&] {
-                                        run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, OnlyQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, Has_sparse_mask>(params, stream);
+                                        BOOL_SWITCH(params.sink_ptr != nullptr, Has_sink_, [&] {
+                                            // Sink kernels only for the shapes in sink_supported(); elsewhere both branches collapse to one instantiation
+                                            static constexpr bool Has_sink = Has_sink_ && Arch >= 90 && sink_supported(kHeadDim, kHeadDimV, cute::is_same_v<T, cutlass::bfloat16_t>, Has_softcap);
+                                            run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, OnlyQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, Has_sparse_mask, Has_sink>(params, stream);
+                                        });
                                     });
                                 });
                             });

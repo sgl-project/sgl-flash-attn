@@ -1168,6 +1168,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         CHECK_DEVICE(sinks);
         CHECK_SHAPE(sinks, num_heads);
         CHECK_CONTIGUOUS(sinks);
+        TORCH_CHECK(sink_supported(params.d_rounded, params.dv_rounded, params.is_bf16, params.softcap > 0.f),
+            "This flash attention build does not support sinks with this head_dim, dtype or softcap.");
         params.sink_ptr = sinks.data_ptr();
     } else {
         params.sink_ptr = nullptr;
