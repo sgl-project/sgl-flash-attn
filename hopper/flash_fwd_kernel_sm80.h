@@ -63,12 +63,15 @@ public:
     static constexpr uint32_t MinBlocksPerMultiprocessor = NumThreads == 128 ? 2 : 1;
 
     // Kernel level shared memory storage
-    // We overlap the shared memory for the mainloop and epilogue. However, we only want smem_o to overlap with smem_v + smem_k and not smem_q
-    // and nothing else, so we'll pad in case sizeof(smem_o) > sizeof(smem_v) + sizeof(smem_k).
+    // We overlap shared memory for the mainloop and epilogue. When Q and V are
+    // separate, smem_o must only overlap smem_v + smem_k, so pad if O is larger.
     static constexpr int mainloop_smem_padding_ = int(sizeof(typename CollectiveEpilogue::TensorStorage))
         - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)))
         - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k)));
-    static constexpr int mainloop_smem_padding = mainloop_smem_padding_ < 0 ? 0 : mainloop_smem_padding_;
+    // Q is already consumed before V is loaded when they share storage, so the
+    // epilogue can reuse that union without reserving a separate region for Q.
+    static constexpr int mainloop_smem_padding = CollectiveMainloop::Share_QV_Smem || mainloop_smem_padding_ < 0
+        ? 0 : mainloop_smem_padding_;
     struct SharedStorage {
         struct TensorStorage : cute::aligned_struct<128> {
             union {

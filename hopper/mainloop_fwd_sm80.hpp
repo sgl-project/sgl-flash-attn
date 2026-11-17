@@ -56,7 +56,7 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
     using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
-    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
+    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split, false /*UseLocalKVOffset*/>;
 
     using MMA_Atom_Arch = std::conditional_t<
         ArchTag::kMinComputeCapability >= 80,
