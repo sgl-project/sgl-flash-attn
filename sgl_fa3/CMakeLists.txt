@@ -68,7 +68,7 @@ FetchContent_Declare(
 FetchContent_Populate(repo-cutlass)
 
 set(SGL_FA3_HOPPER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../hopper")
-if (NOT EXISTS "${SGL_FA3_HOPPER_DIR}/flash_api_stable.cpp")
+if (NOT EXISTS "${SGL_FA3_HOPPER_DIR}/flash_api.cpp")
     message(FATAL_ERROR "FA3 sources not found at ${SGL_FA3_HOPPER_DIR}; build sgl_fa3 from a full checkout")
 endif()
 
@@ -133,7 +133,7 @@ list(FILTER FA3_FP16_GEN_SRCS EXCLUDE REGEX "flash_fwd_hdim64_256_")
 set(SGL_FA3_SOURCES
     "csrc/fa3_extension.cc"
     "${SGL_FA3_HOPPER_DIR}/flash_prepare_scheduler.cu"
-    "${SGL_FA3_HOPPER_DIR}/flash_api_stable.cpp"
+    "${SGL_FA3_HOPPER_DIR}/flash_api.cpp"
     "${SGL_FA3_HOPPER_DIR}/flash_fwd_combine.cu"
     ${FA3_BF16_GEN_SRCS}
     ${FA3_FP16_GEN_SRCS}

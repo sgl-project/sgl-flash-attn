@@ -62,7 +62,6 @@ STABLE_TORCH_LIBRARY(sgl_fa3, m) {
       "    bool     only_qv"
       ") -> (Tensor(a!), Tensor, Tensor, Tensor)");  // first return aliases out
 
-
   /*
    * From flash-attention: get_scheduler_metadata
    * Precomputes tile scheduling for FA3 to avoid per-layer prepare_varlen_num_blocks calls.
@@ -94,11 +93,9 @@ STABLE_TORCH_LIBRARY(sgl_fa3, m) {
       "    bool?    pack_gqa = None,"
       "    int      sm_margin = 0"
       ") -> Tensor");
-
 }
 
 STABLE_TORCH_LIBRARY_IMPL(sgl_fa3, CUDA, m) {
-  // Reuse FA3's existing stable boxed adapters, including its four-result fwd API.
-  m.impl("fwd", &boxed_mha_fwd);
-  m.impl("get_scheduler_metadata", &boxed_mha_fwd_get_scheduler_metadata);
+  m.impl("fwd", TORCH_BOX(&pytorch_shim<&mha_fwd>::call));
+  m.impl("get_scheduler_metadata", TORCH_BOX(&pytorch_shim<&mha_fwd_get_scheduler_metadata>::call));
 }
