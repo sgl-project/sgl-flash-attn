@@ -4,7 +4,9 @@ from typing import Optional, Union
 import torch
 
 # Loading the extension registers torch.ops.sgl_fa3.*.
-from sgl_fa3 import _C  # noqa: F401
+from sgl_fa3._loader import load_library
+
+load_library()
 
 
 @lru_cache(maxsize=1)

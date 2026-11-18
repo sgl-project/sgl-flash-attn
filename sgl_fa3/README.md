@@ -23,8 +23,8 @@ sgl-project/sglang, next to those of the other SGLang-built wheels.
 - `sm_90a`, plus `sm_80`/`sm_86` (A100, A10, L40, 4090). No SM100+ targets.
 - BF16, FP16 and FP8 (E4M3).
 - x86_64 Linux, CUDA 13.0 (`+cu130`), one abi3 wheel for CPython 3.10+.
-- Pinned to `torch==2.14.1`: the extension uses the regular torch C++ ABI, so
-  a release only loads against the torch it was built with.
+- Built against PyTorch 2.11's stable C++ ABI (`TORCH_TARGET_VERSION=0x020B000000000000`).
+  The same binary supports PyTorch 2.11 and newer; the CUDA and GPU requirements still apply.
 
 ## Usage
 
@@ -34,6 +34,8 @@ from sgl_fa3 import flash_attn_varlen_func, flash_attn_with_kvcache, get_schedul
 
 The ops are registered as `torch.ops.sgl_fa3.fwd` and
 `torch.ops.sgl_fa3.get_scheduler_metadata`.
+The Python package loads the native library through `torch.ops.load_library`;
+it does not import a pybind module.
 
 ## Building
 
